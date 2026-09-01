@@ -152,8 +152,12 @@ def cmd_status(args):
     if resp is None:
         print("rocq-warm: no daemon running for %s" % root)
         return 0
-    print("daemon pid %d, up %.0fs, budget %.1f GB"
-          % (resp["pid"], resp["uptime"], resp["budget"] / 1e9))
+    avail = resp.get("available")
+    print("daemon pid %d, up %.0fs, budget %.1f GB%s"
+          % (resp["pid"], resp["uptime"], resp["budget"] / 1e9,
+             "" if avail is None else
+             "; machine has %.1f GB free, yields below %.1f"
+             % (avail / 1e9, resp.get("min_free", 0) / 1e9)))
     for s in resp["sessions"]:
         print("  %-60s %s %4d sentences  %5.1f GB  idle %4.0fs  pid %s"
               % (s["path"], "complete" if s["complete"] else "  parked",

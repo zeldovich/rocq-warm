@@ -15,6 +15,7 @@ session at all:
 * sessions are evicted LRU under a global memory budget, and idle ones time out.
 """
 
+import fcntl
 import json
 import os
 import signal
@@ -31,22 +32,62 @@ DEFAULT_MAX_SESSIONS = 4
 DEFAULT_CHECK_TIMEOUT = 1800.0
 
 
-def _session_ceiling(budget, max_sessions):
-    env = os.environ.get("ROCQ_WARM_MAX_SESSION_GB")
-    if env:
-        return float(env) * 1e9
-    return budget / max(max_sessions, 1)
+# A daemon is per-checkout, and build machines run many checkouts at once.
+# Every one of these defaults is therefore about NOT assuming the machine is
+# ours: a daemon that helps itself to half of RAM is fine alone and ruinous
+# ten-up, and the process it gets killed to make room for is somebody else's.
+DEFAULT_BUDGET_CAP = 32e9       # this daemon's sessions, all together
+DEFAULT_MIN_FREE = 4e9          # ... and leave at least this much for others
+
+
+def _total_bytes():
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        return 0
+
+
+def _available_bytes():
+    """What the kernel thinks can still be allocated without swapping.
+
+    The number that matters on a shared machine: it moves when OTHER people's
+    work grows, which per-daemon bookkeeping cannot see.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _budget_bytes():
     env = os.environ.get("ROCQ_WARM_MAX_RSS_GB")
     if env:
         return float(env) * 1e9
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError):
-        return 32e9
-    return total * 0.5
+    total = _total_bytes()
+    if not total:
+        return DEFAULT_BUDGET_CAP
+    return min(total * 0.5, DEFAULT_BUDGET_CAP)
+
+
+def _min_free_bytes():
+    env = os.environ.get("ROCQ_WARM_MIN_FREE_GB")
+    if env:
+        return float(env) * 1e9
+    return max(DEFAULT_MIN_FREE, _total_bytes() * 0.05)
+
+
+def _session_ceiling(budget, max_sessions):
+    env = os.environ.get("ROCQ_WARM_MAX_SESSION_GB")
+    if env:
+        return float(env) * 1e9
+    # Half the budget, not budget/max_sessions: one big proof legitimately
+    # costs several GB, and a ceiling tight enough to kill it is worse than no
+    # ceiling at all.  This still catches a runaway an order of magnitude out.
+    return budget / 2.0
 
 
 class Entry:
@@ -73,7 +114,9 @@ class Server:
         self.lock = threading.Lock()
         self.idle_timeout = idle_timeout
         self.max_sessions = max_sessions
+        self._lock_fd = None
         self.budget = _budget_bytes()
+        self.min_free = _min_free_bytes()
         self.started = time.time()
 
     # -------------------------------------------------------------- sessions
@@ -182,18 +225,46 @@ class Server:
         return killed
 
     def _evict(self):
-        """Keep the session set inside the count and memory budgets."""
+        """Keep the session set inside our own budget AND the machine's.
+
+        Our own budget bounds one daemon.  It cannot bound ten, and it cannot
+        see the compile somebody else just started, so eviction also yields
+        when the machine as a whole is running out -- which is the only signal
+        that works when the pressure is not ours.  Under real pressure we will
+        give up our last session too: degrading to a cold check is a cost we
+        pay ourselves, where an OOM kill is a cost somebody else pays.
+        """
         while True:
             with self.lock:
                 items = sorted(self.sessions.items(), key=lambda kv: kv[1].last_used)
-                if not items:
-                    return
-                used = sum(e.sess.rss_bytes() for _k, e in items)
-                over = len(items) > self.max_sessions or used > self.budget
-                if not over or len(items) == 1:
-                    return
-                victim = items[0][0]
+            if not items:
+                return
+            used = sum(e.sess.rss_bytes() for _k, e in items)
+            avail = _available_bytes()
+            pressure = avail is not None and avail < self.min_free
+            if not (pressure or len(items) > self.max_sessions
+                    or used > self.budget):
+                return
+            if not pressure and len(items) == 1:
+                return                  # our own budget never costs the last one
+            victim = self._idle_victim(items)
+            if victim is None:
+                return                  # everything we hold is mid-check
             self._drop(victim)
+
+    @staticmethod
+    def _idle_victim(items):
+        """The least-recently-used session that is not mid-check.
+
+        Evicting a session out from under a running check would kill the child
+        it is talking to; that recovers, but it wastes exactly the work we are
+        trying to save.
+        """
+        for key, entry in items:
+            if entry.lock.acquire(blocking=False):
+                entry.lock.release()
+                return key
+        return None
 
     def reap_idle(self):
         now = time.time()
@@ -279,12 +350,27 @@ class Server:
                 "idle": time.time() - entry.last_used,
             })
         return {"ok": True, "pid": os.getpid(), "uptime": time.time() - self.started,
-                "budget": self.budget, "sessions": out}
+                "budget": self.budget, "min_free": self.min_free,
+                "available": _available_bytes(), "sessions": out}
 
     # ----------------------------------------------------------------- serve
 
     def serve(self):
+        """Serve this workspace, if nobody else already is.
+
+        Two clients can race to spawn a daemon.  Without the lock the loser
+        unlinks the winner's socket and binds its own, which orphans a daemon
+        that keeps its sessions resident and unreachable until it times out --
+        exactly the memory nobody can account for.  The lock fd is held for the
+        daemon's life and released when it exits.
+        """
         os.makedirs(self.dir, exist_ok=True)
+        self._lock_fd = os.open(os.path.join(self.dir, "lock"),
+                                os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return                      # somebody else is serving this tree
         try:
             os.unlink(self.sock_path)
         except FileNotFoundError:

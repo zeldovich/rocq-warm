@@ -100,19 +100,37 @@ case the daemon records its sessions and the next daemon kills what the last
 one left, matching on pid **and** cmdline (pids get recycled, and on a shared
 machine a pattern kill takes out other checkouts' sessions too).
 
+### Several checkouts on one machine
+
+A daemon is per-checkout, so agents working in separate trees do not share
+anything: separate sockets under their own `.rocq-warm/`, separate sessions,
+and `stop` in one leaves the others alone. `reap_strays` matches on cmdline as
+well as pid for the same reason — a neighbouring checkout's sessions are never
+in scope. Nothing here pattern-kills.
+
+What does NOT scale by itself is memory, so the defaults assume the machine is
+shared. One daemon's budget is capped rather than being a share of RAM, and
+eviction also watches `MemAvailable`: when the machine as a whole is running
+low, a daemon gives up its least-recently-used session — its own last one, if
+it comes to that. Degrading to a cold check is a cost you pay yourself; an OOM
+kill is a cost somebody else pays.
+
 | variable | default |
 |---|---|
-| `ROCQ_WARM_MAX_RSS_GB` | half of RAM, across all sessions |
-| `ROCQ_WARM_MAX_SESSION_GB` | the global budget divided by the session limit |
+| `ROCQ_WARM_MAX_RSS_GB` | this daemon's sessions together: `min(half of RAM, 32 GB)` |
+| `ROCQ_WARM_MAX_SESSION_GB` | half the budget — enough for a big proof, not for a runaway |
+| `ROCQ_WARM_MIN_FREE_GB` | `max(4 GB, 5% of RAM)` left free for everyone else |
+| sessions per daemon | 4, LRU |
 
-A session costs roughly twice what `coqc` peaks at for the same file, because
-the state machine keeps a state per sentence.
+`rocq-warm status` shows what is resident and how close the machine is to the
+floor. A session costs roughly twice what `coqc` peaks at for the same file,
+because the state machine keeps a state per sentence.
 
 ## Tests
 
 ```console
 $ make test
-Ran 82 tests in 119s
+Ran 89 tests in 123s
 OK
 ```
 

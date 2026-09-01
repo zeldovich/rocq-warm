@@ -143,6 +143,30 @@ and the next daemon kills what the last one left — matching on pid **and**
 cmdline, because pids get recycled and because on a shared machine a pattern
 kill takes out other checkouts' sessions too.
 
+### Many daemons, one machine
+
+Isolation is structural: everything a daemon owns lives under its own
+`<workspace>/.rocq-warm/`, and the stray reaper matches cmdline as well as pid,
+so a neighbouring checkout is never in scope. Nothing pattern-kills.
+
+Memory is the part that does not isolate itself, and it is where a per-daemon
+design goes wrong: a budget expressed as "half of RAM" is correct for one
+daemon and catastrophic for ten, and the process the kernel kills to make room
+belongs to somebody else. So the budget is capped in absolute terms rather than
+being a share, and `_evict` additionally yields whenever `MemAvailable` is
+below a floor -- the only signal that moves when the pressure is not ours.
+Under that pressure a daemon will drop its last session, which costs it a cold
+check and costs its neighbours nothing.
+
+Eviction skips a session that is mid-check, since killing the child out from
+under a running check throws away exactly the work being saved.
+
+Startup is serialised by an `flock` on `.rocq-warm/lock`. Two clients can begin
+a check at the same instant and both try to spawn a daemon; without the lock
+the loser unlinks the winner's socket and binds its own, orphaning a daemon
+that keeps its sessions resident and unreachable -- memory nobody can account
+for, and the failure looks like the tool being merely forgetful.
+
 Guards, because a session that lies is worse than no session: a per-check wall
 timeout; a per-session RSS ceiling that kills the child mid-check; LRU eviction
 under a global budget; an idle timeout after which the daemon exits. And the

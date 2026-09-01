@@ -14,6 +14,7 @@ import time
 import unittest
 
 from rocq_warm_helpers import TOOLS, Workspace, requires_rocq
+from rocqwarm import server
 
 CLI = os.path.join(TOOLS, "rocq-warm")
 
@@ -255,6 +256,131 @@ class DaemonTests(unittest.TestCase):
         """
         out = self.run_cli("status", "--root", self.ws.dir).stdout.decode()
         return [int(m.group(1)) for m in re.finditer(r'pid (\d+)$', out, re.M)]
+
+
+@requires_rocq
+class ConcurrentAgentTests(unittest.TestCase):
+    """Several checkouts on one machine, which is the normal case on a build
+    box: one agent's use of the tool must not disturb another's."""
+
+    def setUp(self):
+        self.a = Workspace("A")
+        self.b = Workspace("B")
+        for ws in (self.a, self.b):
+            self.addCleanup(ws.cleanup)
+            self.addCleanup(self.stop, ws)
+            ws.write("P.v", b"Definition a := 1.\n"
+                            b"Lemma l : True. Proof. exact I. Qed.\n")
+
+    def stop(self, ws):
+        subprocess.run([CLI, "stop", "--root", ws.dir],
+                       capture_output=True, timeout=60)
+
+    def cli(self, ws, *args):
+        return subprocess.run([CLI] + list(args), cwd=ws.dir,
+                              capture_output=True, timeout=300)
+
+    def daemons(self):
+        out = {}
+        for name, ws in (("a", self.a), ("b", self.b)):
+            st = self.cli(ws, "status", "--root", ws.dir).stdout.decode()
+            m = re.search(r'daemon pid (\d+)', st)
+            out[name] = int(m.group(1)) if m else None
+        return out
+
+    def test_each_checkout_gets_its_own_daemon(self):
+        self.assertEqual(self.cli(self.a, "check", "P.v").returncode, 0)
+        self.assertEqual(self.cli(self.b, "check", "P.v").returncode, 0)
+        pids = self.daemons()
+        self.assertIsNotNone(pids["a"])
+        self.assertIsNotNone(pids["b"])
+        self.assertNotEqual(pids["a"], pids["b"])
+
+    def test_stopping_one_leaves_the_other_running(self):
+        self.assertEqual(self.cli(self.a, "check", "P.v").returncode, 0)
+        self.assertEqual(self.cli(self.b, "check", "P.v").returncode, 0)
+        before = self.daemons()
+        self.stop(self.a)
+        after = self.daemons()
+        self.assertIsNone(after["a"], "A's daemon should be gone")
+        self.assertEqual(after["b"], before["b"], "B's daemon was disturbed")
+        warm = self.cli(self.b, "check", "P.v")
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertIn(b"replay", warm.stderr, "B lost its warm session")
+
+    def test_racing_clients_produce_exactly_one_daemon(self):
+        """Two `rocq-warm check` calls can start at the same instant.  Without
+        a lock the loser unlinks the winner's socket and binds its own, and the
+        winner is orphaned -- still holding sessions, unreachable, and invisible
+        to `status` and `stop`."""
+        procs = [subprocess.Popen([CLI, "check", "P.v"], cwd=self.a.dir,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                 for _ in range(8)]
+        for p in procs:
+            _out, err = p.communicate(timeout=300)
+            self.assertEqual(p.returncode, 0, err)
+        time.sleep(1.0)
+        self.assertEqual(_daemons_for(self.a.dir), 1,
+                         "expected exactly one daemon serving the tree")
+
+    def test_one_checkout_does_not_reap_another_s_sessions(self):
+        """`reap_strays` matches on cmdline as well as pid precisely so that a
+        neighbouring checkout's sessions are never in scope."""
+        self.assertEqual(self.cli(self.b, "check", "P.v").returncode, 0)
+        b_sessions = self.session_pids(self.b)
+        self.assertTrue(b_sessions)
+        # Point A's daemon at B's live sessions, then start it.
+        d = os.path.join(self.a.dir, ".rocq-warm")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sessions"), "w") as f:
+            for pid in b_sessions:
+                f.write("%d\t%s\n" % (pid, os.path.join(self.a.dir, "P.v")))
+        self.assertEqual(self.cli(self.a, "check", "P.v").returncode, 0)
+        time.sleep(1.0)
+        self.assertEqual(self.session_pids(self.b), b_sessions,
+                         "A's daemon killed B's sessions")
+
+    def session_pids(self, ws):
+        out = self.cli(ws, "status", "--root", ws.dir).stdout.decode()
+        return [int(m.group(1)) for m in re.finditer(r'pid (\d+)$', out, re.M)]
+
+
+class BudgetTests(unittest.TestCase):
+    """A daemon is per-checkout; the machine is not."""
+
+    def test_the_budget_does_not_assume_the_machine_is_ours(self):
+        total = server._total_bytes()
+        self.assertGreater(total, 0)
+        self.assertLessEqual(server._budget_bytes(), server.DEFAULT_BUDGET_CAP,
+                             "one daemon must not claim an unbounded share")
+        self.assertLessEqual(server._budget_bytes(), total)
+
+    def test_a_session_ceiling_leaves_room_for_a_real_proof(self):
+        budget = server._budget_bytes()
+        self.assertGreater(server._session_ceiling(budget, 4), 4e9,
+                           "a ceiling this tight would kill legitimate proofs")
+
+    def test_pressure_is_read_from_the_machine_not_from_us(self):
+        avail = server._available_bytes()
+        self.assertIsNotNone(avail, "MemAvailable should be readable on Linux")
+        self.assertGreater(avail, 0)
+        self.assertGreater(server._min_free_bytes(), 0)
+
+
+def _daemons_for(root):
+    """How many `rocqwarm.server <root>` processes are alive."""
+    n = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if b"rocqwarm.server" in args and root.encode() in args:
+            n += 1
+    return n
 
 
 def _reap(proc):

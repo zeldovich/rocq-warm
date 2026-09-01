@@ -31,6 +31,16 @@ Rocq 9.x with `rocq` and `coqc` on `PATH`, Python 3.8+, Linux (it reads
 `/proc` to tell a stuck tactic from a session waiting for input). No other
 dependencies, and nothing to install into your opam switch.
 
+## Install
+
+There is nothing to build. Put the entry point on your `PATH`; symlinking is
+supported, and it finds its package through the link:
+
+```sh
+git clone https://github.com/zeldovich/rocq-warm ~/src/rocq-warm
+ln -s ~/src/rocq-warm/rocq-warm ~/bin/rocq-warm
+```
+
 ## Use
 
 ```console
@@ -44,92 +54,30 @@ rocq-warm stop                  # free the sessions
 
 Load path and flags come from the nearest `_CoqProject`.
 
-## How it works
+**It uses the Rocq your shell resolves**, not a configured one, so activate
+your switch the way you would for a raw `coqc`:
 
-`rocq repl -emacs -q -time`, driven over a pipe. Four properties of that stream
-carry the whole design, and the test suite re-derives each from a live Rocq
-rather than assuming it:
+```sh
+eval $(opam env --switch=/path/to/switch)
+rocq-warm check proofs/Big.v
+```
 
-1. **`-time` makes Rocq split the sentences for us.** Every executed sentence
-   prints `Chars A - B [display] N secs (Nu,Ns)` with **byte** offsets into the
-   stdin stream, and the counter runs continuously across separate writes. That
-   removes the biggest correctness risk in a tool like this: a hand-written Coq
-   lexer that has to get nested comments, `*)` inside a string, `..` in
-   recursive notations, bullets and brace-sentences right.
-2. **`-emacs` gives one state id per sentence**, for every vernac kind —
-   queries, `Set`, `Section`/`Module`, bullets, `Fail`, `Qed`.
-3. **A failed sentence does not advance the state id.** That is the verdict
-   signal; grepping the output for `Error:` is not, because a proof's own
-   `idtac` can print anything. A *parse* error is the one case that emits no
-   `Chars` line at all.
-4. **`BackTo <id>` restores the whole system state** — verified for `Require`,
-   `Notation` (the *parser* is restored), `Ltac`, and `Set`/`Unset`. That is
-   what makes the prefix genuinely reusable.
+A call from a different switch cold-starts rather than answering from the one
+the daemon happened to warm up with.
 
-`Set Silent.` is not cosmetic: printing a full proof goal after each of a few
-thousand sentences costs more than the proof does, and without it the REPL runs
-about 3x slower than `coqc`.
+## How it works, briefly
 
-### Deciding what to re-execute
+`rocq repl -emacs -q -time`, driven over a pipe. `-time` makes Rocq report each
+sentence's byte range from its own parser, so there is no hand-written Coq
+lexer to get wrong; `-emacs` gives a state id per sentence, and a failed
+sentence does not advance it; `BackTo` restores the whole system state,
+including the parser after a `Notation`. An edit is located by common byte
+prefix, the session backtracks to the last unaffected sentence, and the rest is
+replayed.
 
-1. **Invalidate?** Any dependency `.vo` rebuilt, or the `_CoqProject` flags
-   changed, and the session is thrown away. The dependency set is the
-   transitive closure from one `rocq dep` run over the project.
-2. Find the first sentence the edit could have touched, by common byte prefix.
-3. A **whitespace/comment-only edit** inside one gap shifts the remaining
-   offsets and executes nothing.
-4. **Undoing a `Require`** forces a cold start. Adding one below the existing
-   ones replays fine.
-5. Otherwise `BackTo` the state after the last unaffected sentence and feed
-   from there.
-6. **Stop at the first failing sentence** and park the session there, so the
-   next edit — the fix for it — replays from exactly that point.
-
-## Three things that look like bugs and are not
-
-**The look-ahead window.** Rocq is fed at most `write_ahead` bytes past what it
-reports having parsed, so an error stops the feed instead of letting Rocq
-re-prove the rest of the file behind it. The window must exceed the largest
-single sentence — real developments have 13 KB ones — or the feed deadlocks,
-because Rocq cannot report a sentence it has not finished reading. It is sized
-from the largest sentence the file has actually shown us, and widens itself
-when that is not enough.
-
-**Cutting a feed short leaves Rocq mid-sentence**, and a bare `.` is not a
-terminator inside a comment or a string. `Session.lex_state` scans what was
-actually written and emits exactly what has to be closed first.
-
-**Message offsets are relative to neither the sentence nor the line the error
-is on.** `Toplevel input, characters A-B` is measured from wherever Rocq landed
-after skipping the whitespace following the previous sentence's `.`:
-
-- whitespace then a newline: the anchor is just past that **first** newline, so
-  further blank lines, indentation and whole comment blocks before the sentence
-  all count into A;
-- anything else first — **a trailing comment on the previous line**, or a
-  second sentence on the same line — and the anchor stays on the *previous*
-  sentence's line.
-
-The second case is not exotic. `Require Import Foo.   (* ... *)` is ordinary
-style, and treating it like the first shifts every column on the following
-sentence by the width of the comment.
-
-## A failing tactic makes the tactics behind it expensive
-
-Rocq keeps executing whatever input it already has when a sentence fails, and
-those tactics now run against a goal of the wrong shape — which is how a
-`vm_compute` ends up on a free variable and eats tens of GB. `coqc` never gets
-there, because it stops at the first error. On one real file (70
-`vm_compute`/`native_compute` calls in 489 lines) a broken tactic mid-file took
-**tens of minutes and 35 GB**; with the interrupt below it takes **5.2 s and
-1.0 GB**.
-
-Once a sentence has failed, any command that keeps burning CPU without
-finishing and without printing anything gets a SIGINT, which Rocq turns into
-`Error: User interrupt.` and carries on from. **That predicate is not
-optional**: Rocq only protects itself from `Sys.Break` while it is *executing*,
-and a signal that lands while it is reading input, printing a prompt, or
-formatting a large goal kills the process outright.
+**[DESIGN.md](DESIGN.md) has the rest** — what the message offsets are actually
+anchored on, why the look-ahead window is sized the way it is, what happens to
+the tactics behind a failure, and how sessions are keyed and collected.
 
 ## What stays running
 
@@ -137,9 +85,10 @@ One daemon per workspace (the git checkout, else the `_CoqProject` directory),
 on `<root>/.rocq-warm/sock`. Under it, one `rocq repl` session per `.v` file.
 
 A session is kept until: the build flags change; a `.vo` it depends on changes;
-`--cold` or `--show-output` is passed; it falls out of the LRU under the
-session-count or memory budget; it goes untouched for the idle timeout; it
-exceeds its own RSS ceiling mid-check; or the check exceeds its wall timeout.
+the `rocq` you invoke with changes; `--cold` or `--show-output` is passed; it
+falls out of the LRU under the session-count or memory budget; it goes
+untouched for the idle timeout; it exceeds its own RSS ceiling mid-check; or
+the check exceeds its wall timeout.
 The daemon exits once it has held nothing for the idle timeout, or as soon as
 its workspace directory disappears.
 
@@ -163,7 +112,7 @@ the state machine keeps a state per sentence.
 
 ```console
 $ make test
-Ran 80 tests in 117s
+Ran 82 tests in 119s
 OK
 ```
 

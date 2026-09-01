@@ -50,13 +50,14 @@ def _budget_bytes():
 
 
 class Entry:
-    def __init__(self, sess, flags, cwd, deps, graph):
+    def __init__(self, sess, flags, cwd, deps, graph, toolchain=None):
         self.sess = sess
         self.flags = flags
         self.cwd = cwd
         self.deps = deps
         self.fingerprint = project.fingerprint(deps)
         self.graph = graph
+        self.toolchain = toolchain
         self.last_used = time.time()
         self.lock = threading.Lock()
 
@@ -77,7 +78,7 @@ class Server:
 
     # -------------------------------------------------------------- sessions
 
-    def _entry(self, path, force_cold=False, silent=True):
+    def _entry(self, path, force_cold=False, silent=True, toolchain=None):
         """The warm session for `path`, cold-started if anything moved."""
         key = os.path.abspath(path)
         with self.lock:
@@ -90,19 +91,30 @@ class Server:
             elif project.fingerprint(entry.deps) != entry.fingerprint:
                 self._drop(key)                 # a dependency was rebuilt
                 entry = None
+            elif entry.toolchain != toolchain:
+                self._drop(key)                 # a different Rocq / opam switch
+                entry = None
             elif (force_cold or not entry.sess.alive
                   or entry.sess.silent != silent):
                 self._drop(key)
                 entry = None
         if entry is None:
+            rocq, env_items = (toolchain or (None, ()))
+            rocq = rocq or "rocq"
+            # MERGE, never replace: subprocess `env=` is the child's whole
+            # environment, and a child without HOME or TMPDIR misbehaves in
+            # ways that have nothing to do with Rocq.
+            env = dict(os.environ, **dict(env_items)) if env_items else None
             proj = project.find_project(key)
             graph = project.dep_graph(
-                flags, cwd, project.project_sources(proj, cwd))
-            deps = project.closure(key, flags, cwd, graph) or []
+                flags, cwd, project.project_sources(proj, cwd),
+                rocq=rocq, env=env)
+            deps = project.closure(key, flags, cwd, graph,
+                                   rocq=rocq, env=env) or []
             sess = session_mod.Session(
-                key, flags, cwd=cwd, silent=silent,
+                key, flags, cwd=cwd, silent=silent, rocq=rocq, env=env,
                 rss_limit=_session_ceiling(self.budget, self.max_sessions))
-            entry = Entry(sess, flags, cwd, deps, graph)
+            entry = Entry(sess, flags, cwd, deps, graph, toolchain)
             with self.lock:
                 self.sessions[key] = entry
             self._record_sessions()
@@ -214,8 +226,11 @@ class Server:
         timeout = float(req.get("timeout") or DEFAULT_CHECK_TIMEOUT)
         # `Set Silent` is decided when the session starts, so asking for the
         # proof's own output means starting over.
+        toolchain = (req.get("rocq"),
+                     tuple(sorted((req.get("env") or {}).items())))
         entry = self._entry(path, force_cold=bool(req.get("cold")),
-                            silent=not bool(req.get("verbose")))
+                            silent=not bool(req.get("verbose")),
+                            toolchain=toolchain)
         with entry.lock:
             if not entry.sess.alive:
                 entry.sess.start()

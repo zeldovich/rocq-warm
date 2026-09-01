@@ -91,7 +91,7 @@ def project_sources(project_path, cwd):
     return files
 
 
-def dep_graph(flags, cwd, sources, timeout=300):
+def dep_graph(flags, cwd, sources, timeout=300, rocq="rocq", env=None):
     """{target.vo: [dep.vo, ...]} for a whole project, in one `rocq dep` run.
 
     One call over ~1300 files costs about 1.5s, so this is affordable at cold
@@ -102,8 +102,9 @@ def dep_graph(flags, cwd, sources, timeout=300):
     if not sources:
         return {}
     try:
-        out = subprocess.run(["rocq", "dep", "-noglob"] + flags + list(sources),
-                             cwd=cwd, capture_output=True, timeout=timeout)
+        out = subprocess.run([rocq, "dep", "-noglob"] + flags + list(sources),
+                             cwd=cwd, capture_output=True, timeout=timeout,
+                             env=env)
     except (OSError, subprocess.TimeoutExpired):
         return {}
     graph = {}
@@ -119,13 +120,13 @@ def dep_graph(flags, cwd, sources, timeout=300):
     return graph
 
 
-def closure(path, flags, cwd, graph):
+def closure(path, flags, cwd, graph, rocq="rocq", env=None):
     """Every .vo the file transitively needs, absolute and sorted."""
     rel = os.path.relpath(os.path.abspath(path), cwd)
     seed = os.path.normpath(os.path.join(cwd, rel[:-2] + ".vo"))
     direct = graph.get(seed)
     if direct is None:
-        direct = _direct_deps(path, flags, cwd)
+        direct = _direct_deps(path, flags, cwd, rocq=rocq, env=env)
         if direct is None:
             return None
     seen, queue = set(), list(direct)
@@ -138,11 +139,12 @@ def closure(path, flags, cwd, graph):
     return sorted(seen)
 
 
-def _direct_deps(path, flags, cwd, timeout=120):
+def _direct_deps(path, flags, cwd, timeout=120, rocq="rocq", env=None):
     rel = os.path.relpath(os.path.abspath(path), cwd)
     try:
-        out = subprocess.run(["rocq", "dep", "-noglob"] + flags + [rel],
-                             cwd=cwd, capture_output=True, timeout=timeout)
+        out = subprocess.run([rocq, "dep", "-noglob"] + flags + [rel],
+                             cwd=cwd, capture_output=True, timeout=timeout,
+                             env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if out.returncode != 0:

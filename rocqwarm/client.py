@@ -18,6 +18,20 @@ import time
 from . import diag, project, server
 
 
+# The environment variables that decide WHICH Rocq runs and where it looks for
+# libraries.  The daemon spawns its sessions with exactly these, taken from the
+# client, so a warm session behaves like the shell you invoked from -- not like
+# the shell that happened to start the daemon an hour ago.
+ROCQ_ENV = ("PATH", "OCAMLPATH", "CAML_LD_LIBRARY_PATH", "OCAMLLIB",
+            "COQPATH", "ROCQPATH", "COQLIB", "ROCQLIB", "COQCORELIB")
+
+
+def rocq_environment():
+    """(absolute rocq, the env that resolved it) for this invocation."""
+    return (shutil.which("rocq"),
+            {k: os.environ[k] for k in ROCQ_ENV if k in os.environ})
+
+
 def workspace_for(path):
     """Where the daemon for `path` lives.
 
@@ -61,11 +75,21 @@ def connect(root, spawn=True, timeout=30.0):
 
 
 def spawn_daemon(root):
+    """Start the daemon, detached, with an explicit path to our own package.
+
+    Not by cwd: `python -m` finding the package because of where it happens to
+    be run from is exactly the kind of thing that breaks when someone moves the
+    checkout or symlinks the entry point.
+    """
     os.makedirs(os.path.join(root, ".rocq-warm"), exist_ok=True)
+    package_parent = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (package_parent + os.pathsep + env["PYTHONPATH"]
+                         if env.get("PYTHONPATH") else package_parent)
     with open(os.path.join(root, ".rocq-warm", "log"), "ab") as log:
         subprocess.Popen(
             [sys.executable, "-m", "rocqwarm.server", root],
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            cwd=package_parent, env=env,
             stdout=log, stderr=log, stdin=subprocess.DEVNULL,
             start_new_session=True)
 
@@ -86,8 +110,10 @@ def cmd_check(args):
     if not os.path.isfile(path):
         raise SystemExit("rocq-warm: no such file: %s" % path)
     root = workspace_for(path)
+    rocq, env = rocq_environment()
     resp = request(root, {"cmd": "check", "path": path, "cold": args.cold,
-                          "timeout": args.timeout, "verbose": args.show_output})
+                          "timeout": args.timeout, "verbose": args.show_output,
+                          "rocq": rocq, "env": env})
     if resp is None or not resp.get("ok"):
         sys.stderr.write("rocq-warm: %s\n" % (resp or {}).get("error", "no response"))
         return 2

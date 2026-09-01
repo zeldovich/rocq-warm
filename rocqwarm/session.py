@@ -72,13 +72,18 @@ class MemoryLimit(Exception):
 
 class Session:
     def __init__(self, path, flags, cwd=None, write_ahead=DEFAULT_WRITE_AHEAD,
-                 silent=True, env=None, rss_limit=None):
+                 silent=True, env=None, rss_limit=None, rocq="rocq"):
         self.path = os.path.abspath(path)
         self.flags = list(flags)
         self.cwd = cwd or os.path.dirname(self.path)
         self.write_ahead = write_ahead
         self.silent = silent
         self.env = env
+        # The absolute `rocq` the CLIENT resolved, not whatever is on the
+        # daemon's PATH.  A daemon outlives the shell that started it, and on a
+        # machine with several opam switches the next caller may well be in a
+        # different one.
+        self.rocq = rocq
         # A ceiling, checked while a check is running.  This tree has had a
         # `vm_compute` on a goal with a free variable reach 31 GB in six
         # minutes; a daemon that keeps such a session resident is worse than no
@@ -105,7 +110,7 @@ class Session:
         # A previous child may be dead but still holding its pipes; `stop` is a
         # no-op when there is none.
         self.stop()
-        argv = ["rocq", "repl", "-emacs", "-q", "-time",
+        argv = [self.rocq, "repl", "-emacs", "-q", "-time",
                 "-topfile", self.path] + self.flags
         self.proc = subprocess.Popen(
             argv, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

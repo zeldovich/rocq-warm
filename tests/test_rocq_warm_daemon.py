@@ -7,6 +7,7 @@ tests therefore drive the real CLI in a subprocess rather than the Session API.
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -121,6 +122,41 @@ class DaemonTests(unittest.TestCase):
                          "stale .vo accepted: %s / %s"
                          % (second.stdout, second.stderr))
         self.assertIn(b"cold", second.stderr)
+
+    def test_a_different_rocq_invalidates_the_session(self):
+        """A daemon outlives the shell that started it.  On a machine with
+        several opam switches the next caller may be in a different one, and
+        silently answering from the old switch's Rocq is the worst kind of
+        wrong: a confident OK about a toolchain you are not using."""
+        first = self.check()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        real = shutil.which("rocq")
+        self.assertIsNotNone(real)
+        # A different absolute path to the same binary is enough: what matters
+        # is that the daemon notices it is not the one it warmed up with.
+        alias_dir = os.path.join(self.ws.dir, "bin")
+        os.makedirs(alias_dir, exist_ok=True)
+        for tool in ("rocq", "coqc"):
+            link = os.path.join(alias_dir, tool)
+            if not os.path.exists(link):
+                os.symlink(shutil.which(tool), link)
+        env = dict(os.environ, PATH=alias_dir + os.pathsep + os.environ["PATH"])
+        again = subprocess.run([CLI, "check", self.NAME], cwd=self.ws.dir,
+                               env=env, capture_output=True, timeout=300)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn(b"cold", again.stderr,
+                      "reused a session warmed up with a different rocq")
+
+    def test_the_session_runs_the_client_s_rocq(self):
+        self.assertEqual(self.check().returncode, 0)
+        pids = self.session_pids()
+        self.assertTrue(pids)
+        got = os.path.realpath("/proc/%d/exe" % pids[0])
+        want_prefix = os.path.dirname(os.path.dirname(
+            os.path.realpath(shutil.which("rocq"))))
+        self.assertTrue(got.startswith(want_prefix),
+                        "session runs %s, not the rocq the client resolved "
+                        "(%s)" % (got, want_prefix))
 
     def test_changing_the_project_flags_invalidates_the_session(self):
         self.assertEqual(self.check().returncode, 0)

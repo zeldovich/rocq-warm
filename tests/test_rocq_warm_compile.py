@@ -39,7 +39,10 @@ class CompilerTests(unittest.TestCase):
         job = self.submit("A.v")
         self.comp.wait(self.ws.path("A.v"), timeout=120)
         self.assertEqual(job.state, "ok", job.output)
-        for suffix in (".vo", ".glob", ".vok", ".vos"):
+        # .vo and .glob are what `coqc` produces on every 9.x; .vok/.vos are
+        # a -vos/-vok concern and Rocq 9.2 stopped writing them on a plain
+        # compile, so do not require them.
+        for suffix in (".vo", ".glob"):
             self.assertTrue(os.path.exists(self.ws.path("A" + suffix)), suffix)
         # And Rocq accepts the result.
         self.ws.write("B.v", b"Require Import T.A.\nDefinition b := a.\n")

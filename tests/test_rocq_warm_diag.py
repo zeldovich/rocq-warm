@@ -178,5 +178,89 @@ class LocationTests(unittest.TestCase):
         self.assertEqual(render_all(result, self.NAME, bad), cold)
 
 
+
+class InfoMessageSplitTests(unittest.TestCase):
+    """`-emacs` tags every info message with <infomsg>...</infomsg>.  When
+    Rocq prints one right after a warning -- a definition's "foo is defined"
+    after a deprecation warning -- it must be its own blob, or it rides along
+    inside the warning and gets rendered as part of it.  `Set Silent` hid
+    these on Rocq 9.0/9.1; 9.2 prints them even under Silent, so this is
+    pinned directly on the splitter rather than only through a live Rocq.
+    """
+
+    def diags(self, blob, silent):
+        return session_mod._diags_of(
+            _Item(blob), include_info=not silent)
+
+    def test_an_infomsg_after_a_warning_is_a_separate_blob(self):
+        blob = (b"Toplevel input, characters 0-21:\n"
+                b"<warning>\nWarning: Reference old is deprecated. use new\n"
+                b"[deprecated-reference,deprecated,default]\n</warning>\n"
+                b"<infomsg>use is defined</infomsg>")
+        # Under Set Silent (the default), only the warning survives.
+        silent = self.diags(blob, silent=True)
+        self.assertEqual([d.kind for d in silent], ["warning"])
+        self.assertNotIn(b"is defined", silent[0].message())
+        self.assertIn(b"deprecated", silent[0].message())
+        # Asked for info too, the "is defined" comes back as its own info diag.
+        loud = self.diags(blob, silent=False)
+        self.assertEqual([d.kind for d in loud], ["warning", "info"])
+        self.assertIn(b"use is defined", loud[1].message())
+
+    def test_a_lone_infomsg_is_info(self):
+        blob = b"<infomsg>old is defined</infomsg>"
+        self.assertEqual(self.diags(blob, silent=True), [])
+        loud = self.diags(blob, silent=False)
+        self.assertEqual([d.kind for d in loud], ["info"])
+
+    def test_two_infomsgs_around_a_warning_stay_three_blobs(self):
+        blob = (b"<infomsg>a is defined</infomsg>\n"
+                b"Toplevel input, characters 0-5:\n"
+                b"<warning>\nWarning: something [w,default]\n</warning>\n"
+                b"<infomsg>b is defined</infomsg>")
+        self.assertEqual([d.kind for d in self.diags(blob, silent=False)],
+                         ["info", "warning", "info"])
+        self.assertEqual([d.kind for d in self.diags(blob, silent=True)],
+                         ["warning"])
+
+
+class _Item:
+    """The one attribute `_diags_of` reads off a sentence."""
+
+    def __init__(self, messages):
+        self.messages = messages
+        self.anchor = 0
+
+
+@requires_rocq
+class SilentInfoTests(unittest.TestCase):
+    """End to end: a definition's own "is defined" chatter, printed alongside
+    a real warning, never reaches the diagnostics a warm check reports.  On
+    Rocq 9.2 that chatter survives `Set Silent`; the diagnostics must match a
+    batch `coqc` regardless."""
+
+    NAME = "Info.v"
+
+    def setUp(self):
+        self.ws = Workspace()
+        self.addCleanup(self.ws.cleanup)
+
+    def test_definition_feedback_is_not_reported_as_a_diagnostic(self):
+        text = (b'#[deprecated(since="1.0", note="use new")]\n'
+                b"Definition old := 1.\n"
+                b"Definition use := old.\n")
+        path = self.ws.write(self.NAME, text)
+        sess = session_mod.Session(path, self.ws.flags, cwd=self.ws.dir)
+        sess.start()
+        self.addCleanup(sess.stop)
+        result = sess.check(text, timeout=300)
+        self.assertTrue(result.ok, [d.render(self.NAME, text) for d in result.diags])
+        rendered = render_all(result, self.NAME, text)
+        self.assertNotIn("is defined", rendered,
+                         "definition feedback leaked into the diagnostics")
+        _rc, cold = self.ws.coqc(self.NAME)
+        self.assertEqual(rendered, cold)
+
+
 if __name__ == "__main__":
     unittest.main()

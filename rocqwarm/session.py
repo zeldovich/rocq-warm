@@ -870,12 +870,44 @@ def _diags_of(item, include_info=False):
     return out
 
 
+INFOMSG_RE = re.compile(rb'<infomsg>.*?</infomsg>', re.S)
+
+
 def _split_messages(raw):
-    """Split one sentence's output into individual message blobs."""
+    """Split one sentence's output into individual message blobs.
+
+    Two boundaries, not one.  Errors and warnings are delimited by their
+    `Toplevel input, characters A-B:` location line, and `-emacs` wraps every
+    INFO message -- a definition's "foo is defined", a `Locate` result -- in
+    its own `<infomsg>...</infomsg>`.  Splitting on the location line alone
+    lets an info message that Rocq printed right after a warning ride along
+    inside the warning's blob, where it is classified as a warning and
+    rendered as part of it.  `Set Silent` hid those infomsgs on Rocq 9.0/9.1
+    so it never showed; 9.2 prints them even under Silent, so a warm run
+    reported a "foo is defined" line that a batch `coqc` never does.  Honour
+    the `<infomsg>` boundaries Rocq already gives us, and each becomes the
+    info blob it is -- dropped under `Set Silent`, never merged into a
+    warning.
+    """
     if not raw or not raw.strip():
         return []
-    parts = re.split(rb'(?m)(?=^Toplevel input, characters )', raw)
-    return [p for p in parts if p.strip()]
+    segments, last = [], 0
+    for m in INFOMSG_RE.finditer(raw):
+        segments.append((False, raw[last:m.start()]))
+        segments.append((True, m.group(0)))
+        last = m.end()
+    segments.append((False, raw[last:]))
+    out = []
+    for is_info, seg in segments:
+        if not seg.strip():
+            continue
+        if is_info:
+            out.append(seg)
+        else:
+            out += [p for p in
+                    re.split(rb'(?m)(?=^Toplevel input, characters )', seg)
+                    if p.strip()]
+    return out
 
 
 class Diag:

@@ -332,9 +332,10 @@ class VoTests(StalenessCase):
         self.assertIn(b"wrote Dep.vo", proc.stderr)
         self.assertNotIn(b"NOT regenerated", proc.stderr)
         self.assertTrue(self.vo_fresh())
-        for extra in (".glob", ".vok", ".vos"):
-            self.assertTrue(os.path.exists(self.ws.path("Dep" + extra)),
-                            "make would have produced Dep%s too" % extra)
+        # .glob is produced on every 9.x; .vok/.vos are not (9.2 dropped them
+        # from a plain compile), so the durable check is that a dependent
+        # actually loads the .vo we wrote.
+        self.assertTrue(os.path.exists(self.ws.path("Dep.glob")))
         self.assertChecked(self.check("User.v"))
 
     def test_compile_on_a_red_check_writes_nothing(self):

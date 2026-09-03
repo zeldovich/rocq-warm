@@ -1,0 +1,40 @@
+# Every test drives a real rocq and diffs the answer against a real coqc, so
+# the job runs inside the official Rocq images rather than installing a
+# toolchain.  One job per Rocq version the tool is meant to work with.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rocq: ['9.0.1', '9.1.1', '9.2.0']
+    name: rocq ${{ matrix.rocq }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coq-community/docker-coq-action@v1
+        with:
+          custom_image: rocq/rocq-prover:${{ matrix.rocq }}
+          custom_script: |
+            startGroup "Install python3"
+              sudo apt-get update -y -q
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3
+            endGroup
+            startGroup "Workaround permission issue"
+              sudo chown -R 1000:1000 .
+            endGroup
+            startGroup "Versions"
+              rocq --version
+              python3 --version
+            endGroup
+            startGroup "Test"
+              make test
+            endGroup
+      - name: Revert permissions
+        if: ${{ always() }}
+        run: sudo chown -R 1001:116 .

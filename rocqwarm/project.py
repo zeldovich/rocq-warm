@@ -18,6 +18,7 @@ cold `coqc` would:
 
 import os
 import subprocess
+import threading
 
 
 PROJECT_NAMES = ("_CoqProject", "_RocqProject")
@@ -200,6 +201,10 @@ class DepGraph:
         self.graph = {}         # vo -> [vo]
         self.stamps = {}        # abs .v -> mtime_ns
         self.refreshes = 0      # how many `rocq dep` runs, for the tests
+        # One DepGraph is shared by every session in a project, and several
+        # clients can check different files in it at the same instant, so the
+        # mutation in `refresh` and the reads in `closure`/`direct` are locked.
+        self._lock = threading.Lock()
 
     def refresh(self, extra=()):
         """Bring the graph up to date; returns the number of files re-scanned.
@@ -208,6 +213,10 @@ class DepGraph:
         them -- the file being checked is always one, so that a file outside
         the project still gets its own dependencies looked up.
         """
+        with self._lock:
+            return self._refresh_locked(extra)
+
+    def _refresh_locked(self, extra=()):
         rel = {}
         for s in project_sources(self.project_path, self.cwd, self.flags):
             rel[os.path.normpath(os.path.join(self.cwd, s))] = s
@@ -248,14 +257,27 @@ class DepGraph:
 
     def direct(self, path):
         """The .vo files `path` requires directly, or None if unknown."""
-        return self.graph.get(vo_of(os.path.abspath(path)))
+        with self._lock:
+            return self.graph.get(vo_of(os.path.abspath(path)))
 
     def closure(self, path):
         """Every .vo `path` transitively loads, absolute and sorted."""
-        direct = self.direct(path)
-        if direct is None:
-            direct = _direct_deps(path, self.flags, self.cwd,
-                                  rocq=self.rocq, env=self.env) or []
+        seed = vo_of(os.path.abspath(path))
+        with self._lock:
+            direct = self.graph.get(seed)
+            if direct is not None:
+                return self._walk_locked(direct)
+        # Not in the graph -- a file outside the project.  Ask `rocq dep`
+        # for its direct requires WITHOUT the lock (it is a subprocess), then
+        # walk the shared graph under the lock again.
+        direct = _direct_deps(path, self.flags, self.cwd,
+                              rocq=self.rocq, env=self.env) or []
+        with self._lock:
+            return self._walk_locked(direct)
+
+    def _walk_locked(self, direct):
+        """The transitive closure of `direct` through the graph.  Caller holds
+        the lock; every read of self.graph happens under it."""
         seen, queue = set(), list(direct)
         while queue:
             d = queue.pop()

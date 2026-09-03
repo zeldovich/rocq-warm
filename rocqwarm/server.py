@@ -162,37 +162,63 @@ class Server:
                 self.graphs[key] = g
         return g
 
+    def _stale_entry(self, entry, flags, toolchain, force_cold, silent):
+        """Why `entry` cannot be reused now, or None if it can."""
+        if entry.flags != flags:
+            return "the build flags changed"
+        if entry.toolchain != toolchain:
+            return "a different Rocq / opam switch"
+        if entry.loaded_changed():
+            return "a dependency was rebuilt"
+        if force_cold or not entry.sess.alive or entry.sess.silent != silent:
+            return "cold"
+        return None
+
     def _entry(self, path, force_cold=False, silent=True, toolchain=None):
-        """The warm session for `path`, cold-started if anything moved."""
+        """The warm session for `path`, cold-started if anything moved.
+
+        The whole get-or-create runs under `self.lock`, so there is exactly
+        ONE Entry per file even when several clients check it at the same
+        instant.  Without that, two threads each build their own session for
+        one file and one thread's `_drop` tears down the process the other is
+        mid-write on -- which surfaces as `NoneType has no attribute stdin`
+        from deep inside a feed.  The Session constructor is cheap (it spawns
+        nothing; `start()` does, later and under the entry's own lock), so
+        holding the lock across it costs nothing.
+        """
         key = os.path.abspath(path)
+        flags, cwd = project.flags_for(key)
+        to_stop = None
+        created = False
         with self.lock:
             entry = self.sessions.get(key)
-        flags, cwd = project.flags_for(key)
-        if entry is not None:
-            if entry.flags != flags:
-                self._drop(key)                 # the build flags changed
-                entry = None
-            elif entry.toolchain != toolchain:
-                self._drop(key)                 # a different Rocq / opam switch
-                entry = None
-            elif entry.loaded_changed():
-                self._drop(key)                 # a dependency was rebuilt
-                entry = None
-            elif (force_cold or not entry.sess.alive
-                  or entry.sess.silent != silent):
-                self._drop(key)
-                entry = None
-        if entry is None:
-            rocq, env = self._toolchain_env(toolchain)
-            sess = session_mod.Session(
-                key, flags, cwd=cwd, silent=silent, rocq=rocq, env=env,
-                rss_limit=_session_ceiling(self.budget, self.max_sessions))
-            entry = Entry(sess, flags, cwd, toolchain)
-            with self.lock:
+            if entry is not None and self._stale_entry(
+                    entry, flags, toolchain, force_cold, silent):
+                # Replace it -- but only actually stop it if nobody is using
+                # it right now.  A session mid-check holds its own lock; tearing
+                # its process out from under the check is the very race this
+                # method exists to avoid.  A still-busy stale session is simply
+                # orphaned from the table and stopped when its check ends.
+                del self.sessions[key]
+                if entry.lock.acquire(blocking=False):
+                    to_stop, entry = entry, None
+                else:
+                    entry = None
+            if entry is None:
+                rocq, env = self._toolchain_env(toolchain)
+                sess = session_mod.Session(
+                    key, flags, cwd=cwd, silent=silent, rocq=rocq, env=env,
+                    rss_limit=_session_ceiling(self.budget, self.max_sessions))
+                entry = Entry(sess, flags, cwd, toolchain)
                 self.sessions[key] = entry
+                created = True
+            entry.last_used = time.time()
+        if to_stop is not None:
+            to_stop.sess.stop()
+            to_stop.lock.release()
+        if created:
             self._record_sessions()
             self._evict()
-        entry.last_used = time.time()
         return entry
 
     def _drop(self, key):

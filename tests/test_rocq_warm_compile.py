@@ -14,8 +14,11 @@ import unittest
 from rocq_warm_helpers import Workspace, requires_rocq, wait_for
 from rocqwarm import compile as compile_mod
 
-SLOW = b"Definition x := 1.\nLemma slow : True.\nProof. do 3000000 idtac. exact I. Qed.\n"
-SLOW_BASE = b"Definition base := 1.\nLemma slow : True.\nProof. do 3000000 idtac. exact I. Qed.\n"
+# Sized so the compile runs several seconds even on a slow, shared CI core,
+# leaving a wide margin for a racing action (a cancel, a stop, an edit) to
+# land while it is unambiguously still running.
+SLOW = b"Definition x := 1.\nLemma slow : True.\nProof. do 20000000 idtac. exact I. Qed.\n"
+SLOW_BASE = b"Definition base := 1.\nLemma slow : True.\nProof. do 20000000 idtac. exact I. Qed.\n"
 
 
 def mtime(path):

@@ -238,9 +238,12 @@ class Session:
 
     def _raw_write(self, data):
         """Write bypassing the look-ahead window (recovery text only)."""
+        proc = self.proc
+        if proc is None:
+            raise SessionDead("session was stopped mid-write")
         try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
+            proc.stdin.write(data)
+            proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError):
             return
         with self._cv:
@@ -283,9 +286,12 @@ class Session:
                             blocked_since = time.time()
                     budget = self.parsed_end + self.write_ahead - self.stream_written
             n = min(len(data) - pos, max(budget, 512))
+            proc = self.proc
+            if proc is None:
+                return                  # stopped under us; the waiter sees it
             try:
-                self.proc.stdin.write(data[pos:pos + n])
-                self.proc.stdin.flush()
+                proc.stdin.write(data[pos:pos + n])
+                proc.stdin.flush()
             except (BrokenPipeError, ValueError, OSError) as e:
                 if isinstance(e, OSError) and e.errno not in (errno.EPIPE,):
                     raise

@@ -244,11 +244,15 @@ class WatchedSetTests(StalenessCase):
         busy would be recorded with its NEW mtime -- as if that were what got
         loaded -- and the session kept."""
         slow = (b"Require Import T.Dep.\nLemma slow : True.\n"
-                b"Proof. do 3000000 idtac. exact I. Qed.\nDefinition u := dep.\n")
+                b"Proof. do 20000000 idtac. exact I. Qed.\nDefinition u := dep.\n")
         self.ws.write("User.v", slow)
         proc = subprocess.Popen([CLI, "check", "User.v"], cwd=self.ws.dir,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.6)             # the session is inside the slow proof
+        # Wait until the daemon actually holds a session for User.v (it has
+        # loaded Dep.vo by then and is grinding through the slow proof), rather
+        # than guessing at a fixed delay that a slow CI runner blows past.
+        self.assertTrue(wait_for(lambda: "User.v" in self.status(), timeout=120),
+                        "the check never started")
         self.ws.touch("Dep.v", b"Definition dep := 1. (* rebuilt *)\n")
         self.ws.build("Dep.v")
         out, err = proc.communicate(timeout=300)
@@ -283,7 +287,7 @@ class VoTests(StalenessCase):
     # Slow enough that a second process can act while the compile runs even
     # on a loaded machine; the check and the compile each take a few seconds.
     SLOW_DEP = (b"Definition dep := 1.\nLemma slow : True.\n"
-                b"Proof. do 8000000 idtac. exact I. Qed.\n")
+                b"Proof. do 20000000 idtac. exact I. Qed.\n")
 
     def setUp(self):
         super().setUp()

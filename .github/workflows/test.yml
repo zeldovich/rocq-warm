@@ -1,6 +1,6 @@
 # Every test drives a real rocq and diffs the answer against a real coqc, so
 # the job runs inside the official Rocq images rather than installing a
-# toolchain.  One job per Rocq version the tool is meant to work with.
+# toolchain.  One leg per Rocq version the tool is meant to work with.
 name: test
 
 on:
@@ -16,7 +16,8 @@ jobs:
         rocq: ['9.0.1', '9.1.1', '9.2.0']
     name: rocq ${{ matrix.rocq }}
     steps:
-      - uses: actions/checkout@v4
+      # v5+ runs on Node 24; v4 runs on the now-deprecated Node 20.
+      - uses: actions/checkout@v5
       - uses: coq-community/docker-coq-action@v1
         with:
           custom_image: rocq/rocq-prover:${{ matrix.rocq }}
@@ -28,9 +29,28 @@ jobs:
             startGroup "Workaround permission issue"
               sudo chown -R 1000:1000 .
             endGroup
+            startGroup "A coqc for the test oracle"
+              # The suite uses `coqc` as its reference compiler, but the
+              # rocq-prover image ships only `rocq`.  `coqc ARGS` is exactly
+              # `rocq compile ARGS` (byte-identical output, -time included), so
+              # provide a shim when the image has no coqc of its own.
+              if ! command -v coqc >/dev/null 2>&1; then
+                printf '#!/bin/sh\nexec rocq compile "$@"\n' | \
+                  sudo tee /usr/local/bin/coqc >/dev/null
+                sudo chmod +x /usr/local/bin/coqc
+              fi
+            endGroup
             startGroup "Versions"
               rocq --version
+              coqc --version
               python3 --version
+            endGroup
+            startGroup "Guard: the real tests must actually run"
+              # Without both binaries every `@requires_rocq` test silently
+              # skips and the suite passes having tested nothing.  Fail loudly
+              # instead.
+              command -v rocq >/dev/null || { echo "no rocq on PATH"; exit 1; }
+              command -v coqc >/dev/null || { echo "no coqc on PATH"; exit 1; }
             endGroup
             startGroup "Test"
               make test

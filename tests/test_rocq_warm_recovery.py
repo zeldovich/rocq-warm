@@ -165,6 +165,29 @@ class EarlyStopTests(unittest.TestCase):
         self.ws.write(self.NAME, good)
         self.assertTrue(s.check(good, timeout=300).ok)
 
+    def test_a_file_that_ends_inside_a_comment_leaves_a_usable_session(self):
+        """The sentinel goes in after the text, so a trailing open comment
+        swallows it and Rocq sits waiting for more.  Reporting that is easy;
+        the trap is what the NEXT write lands in.  Before the recovery here,
+        the `BackTo` of the following check went into the comment too, and
+        the session was lost for a file that was never going to pass."""
+        good = b"Definition a := 1.\nLemma l : True.\nProof. exact I. Qed.\n"
+        bad = good + b"Lemma m : True.\nProof.\n(* not finished"
+        s = self.session(good)
+        self.assertTrue(s.check(good, timeout=300).ok)
+        broken = s.check(bad, timeout=300)
+        self.assertFalse(broken.ok)
+        self.assertIn(b"unterminated", broken.diags[-1].message())
+        # Still answering questions from where it is parked ...
+        libs = s.loaded_libraries()
+        self.assertTrue(libs, "no libraries reported after an unterminated feed")
+        # ... and still checking.
+        fixed = bad + b" *)\nexact I. Qed.\n"
+        self.ws.write(self.NAME, fixed)
+        again = s.check(fixed, timeout=300)
+        self.assertTrue(again.ok, [d.render(self.NAME, fixed) for d in again.diags])
+        self.assertEqual(again.total, 9)
+
     def test_a_sentence_larger_than_the_initial_window(self):
         """The look-ahead window starts smaller than some real sentences (this
         tree has one of 13575 bytes); it has to widen itself rather than

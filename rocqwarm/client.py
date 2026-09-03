@@ -3,13 +3,21 @@
 Prints diagnostics in `coqc`'s exact format, so `grep Error` and every other
 habit built around a build log keeps working, and exits 0/1 the way `coqc`
 does.  It does NOT write a `.vo`: this is the edit loop, `make` is still the
-source of truth.  `--compile` runs a real `coqc` afterwards when you want both.
+source of truth, and a real compile would double the cost of every passing
+check.  So a green check says that its `.vo` is now behind, and a check of
+anything that requires it is refused until the `.vo` is rebuilt -- by `make`,
+by `--compile` on the file, or by `--rebuild` on the dependent.
+
+Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked at
+all -- a dependency whose `.vo` is older than its source, no daemon, no rocq
+-- and 3 for the one thing that must never happen, a green verdict that a
+real `rocq compile` then rejects.
 """
 
 import argparse
 import json
-import shutil
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -111,39 +119,89 @@ def cmd_check(args):
         raise SystemExit("rocq-warm: no such file: %s" % path)
     root = workspace_for(path)
     rocq, env = rocq_environment()
+    display = os.path.relpath(path, root)
     resp = request(root, {"cmd": "check", "path": path, "cold": args.cold,
                           "timeout": args.timeout, "verbose": args.show_output,
-                          "rocq": rocq, "env": env})
-    if resp is None or not resp.get("ok"):
-        sys.stderr.write("rocq-warm: %s\n" % (resp or {}).get("error", "no response"))
+                          "rocq": rocq, "env": env,
+                          "allow_stale": args.allow_stale,
+                          "rebuild": args.rebuild,
+                          "wait_vo": args.compile})
+    if resp is None:
+        sys.stderr.write("rocq-warm: no response\n")
         return 2
+    if not resp.get("ok"):
+        return report_refusal(resp, display, root)
     text = open(path, "rb").read()
-    display = os.path.relpath(path, root)
     if args.json:
         print(json.dumps(resp, indent=2))
     else:
         for d in resp["diags"]:
             span = tuple(d["span"]) if d["span"] else None
             print(diag.render(display, text, span, d["message"].encode()))
+    for row in resp.get("stale") or ():
+        sys.stderr.write("rocq-warm: warning: checking against a stale "
+                         "dependency: %s\n" % relativize(row["why"], root))
+    if resp.get("note"):
+        sys.stderr.write("rocq-warm: warning: %s\n" % resp["note"])
     verdict = "OK" if resp["passed"] else "FAILED"
+    vo = resp.get("vo")
+    tail = "; wrote %s.vo" % display[:-2] if vo and vo["state"] == "ok" else ""
     sys.stderr.write(
-        "rocq-warm: %s %s [%s, %d/%d sentences, %.1fs, %.1f GB]\n"
+        "rocq-warm: %s %s [%s, %d/%d sentences, %.1fs, %.1f GB]%s\n"
         % (display, verdict, resp["mode"], resp["replayed"], resp["sentences"],
-           resp["seconds"], resp["rss"] / 1e9))
+           resp["seconds"], resp["rss"] / 1e9, tail))
+    if resp["passed"] and not args.compile and resp.get("vo_stale"):
+        # The thing that bites: the file is green, and everything that
+        # requires it is still reading the .vo from before the edit.
+        sys.stderr.write(
+            "rocq-warm: warning: %s.vo was NOT regenerated (%s); anything "
+            "that requires it is refused until it is rebuilt -- run make, or "
+            "`rocq-warm check %s --compile`\n"
+            % (display[:-2], relativize(resp["vo_stale"], root), display))
     if resp["passed"] and args.compile:
-        rc = compile_for_real(path)
-        if rc != 0:
-            sys.stderr.write("rocq-warm: coqc DISAGREED (exit %d) -- this is a "
-                             "bug in rocq-warm, please report it\n" % rc)
-            return 3
+        if vo is None or vo["state"] != "ok":
+            sys.stdout.write(vo["output"] if vo else "")
+            if vo is not None and vo["state"] == "failed":
+                sys.stderr.write("rocq-warm: rocq compile DISAGREED (exit %s) "
+                                 "-- this is a bug in rocq-warm, please "
+                                 "report it\n" % vo["rc"])
+                return 3
+            sys.stderr.write("rocq-warm: the .vo was not written (%s)\n"
+                             % (vo["state"] if vo else "no compile was run"))
+            return 2
     return 0 if resp["passed"] else 1
 
 
-def compile_for_real(path):
-    """A real `coqc`, for when you want the .vo as well as the verdict."""
-    flags, cwd = project.flags_for(path)
-    rel = os.path.relpath(path, cwd)
-    return subprocess.call(["coqc", "-q"] + flags + [rel], cwd=cwd)
+def relativize(text, root):
+    return text.replace(root + os.sep, "")
+
+
+def report_refusal(resp, display, root):
+    """A check that did not happen, and exactly why.  Exit 2, never 1: this
+    is not a verdict about the proof."""
+    stale = resp.get("stale")
+    if stale:
+        sys.stderr.write(
+            "rocq-warm: %s NOT CHECKED -- %d dependenc%s stale (make would "
+            "rebuild %s):\n" % (display, len(stale),
+                                 "y is" if len(stale) == 1 else "ies are",
+                                 "it" if len(stale) == 1 else "them"))
+        for row in stale:
+            sys.stderr.write("  %s\n" % relativize(row["why"], root))
+            if row.get("compile_output"):
+                sys.stdout.write(row["compile_output"])
+        sys.stderr.write(
+            "rocq-warm: rebuild %s first, or pass --rebuild to have rocq-warm "
+            "compile %s, or --allow-stale to check against %s anyway\n"
+            % (("it", "it", "it") if len(stale) == 1 else
+               ("them", "them", "them")))
+        return 2
+    for job in resp.get("compile_failed") or ():
+        sys.stdout.write(job["output"])
+        sys.stderr.write("rocq-warm: rebuilding %s FAILED (%s)\n"
+                         % (relativize(job["path"], root), job["why"]))
+    sys.stderr.write("rocq-warm: %s\n" % resp.get("error", "no response"))
+    return 2
 
 
 def cmd_status(args):
@@ -159,9 +217,14 @@ def cmd_status(args):
              "; machine has %.1f GB free, yields below %.1f"
              % (avail / 1e9, resp.get("min_free", 0) / 1e9)))
     for s in resp["sessions"]:
-        print("  %-60s %s %4d sentences  %5.1f GB  idle %4.0fs  pid %s"
+        print("  %-60s %s %4d sentences  %5.1f GB  idle %4.0fs  %4d .vo watched  pid %s"
               % (s["path"], "complete" if s["complete"] else "  parked",
-                 s["sentences"], s["rss"] / 1e9, s["idle"], s["pid"]))
+                 s["sentences"], s["rss"] / 1e9, s["idle"],
+                 s.get("watched", 0), s["pid"]))
+    for j in resp.get("compiles") or ():
+        print("  compile %-52s %-9s %5.0fs%s"
+              % (j["path"], j["state"], j["seconds"],
+                 "  " + j["why"] if j.get("why") else ""))
     return 0
 
 
@@ -186,7 +249,14 @@ def main(argv=None):
     c.add_argument("--timeout", type=float, default=1800.0)
     c.add_argument("--json", action="store_true")
     c.add_argument("--compile", action="store_true",
-                   help="on success, also run a real coqc (writes the .vo)")
+                   help="on success, also run a real rocq compile (writes the "
+                        ".vo; exit 3 if it disagrees)")
+    c.add_argument("--rebuild", action="store_true",
+                   help="compile stale dependencies (and what depends on "
+                        "them) before checking, instead of refusing")
+    c.add_argument("--allow-stale", action="store_true",
+                   help="check even if a dependency's .vo is older than its "
+                        "source (the verdict is then about the OLD library)")
     c.add_argument("--show-output", action="store_true",
                    help="also print what the proof itself prints (goals, Time, "
                         "Print Assumptions); much slower on Iris proofs")

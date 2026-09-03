@@ -8,7 +8,16 @@ Every guard here exists because a warm session that lies is worse than no
 session at all:
 
 * a rebuilt dependency `.vo` throws the session away rather than being checked
-  against the copy Rocq loaded into memory an hour ago;
+  against the copy Rocq loaded into memory an hour ago -- and the set of
+  `.vo` files watched is the one Rocq itself reports having loaded, not a
+  guess from `rocq dep`;
+* a dependency whose `.vo` is older than its `.v` (or than a `.vo` it
+  requires) is refused, not checked against: the verdict would be about a
+  library that no longer exists.  Make's own rule decides what "older" means;
+* a green check does NOT write a `.vo` -- that would double the cost of
+  every passing check -- so it says so, and a dependent checked next is
+  refused until the `.vo` is rebuilt (by `make`, by `--compile`, or by
+  `--rebuild`).  A compile the daemon is running itself is waited for;
 * a session that exceeds its RSS ceiling or a check that exceeds its wall
   timeout is killed and reported, not left resident -- a large development has a history
   of a single `vm_compute` reaching 31 GB;
@@ -25,7 +34,7 @@ import sys
 import threading
 import time
 
-from . import project, session as session_mod
+from . import compile as compile_mod, project, session as session_mod
 
 DEFAULT_IDLE_TIMEOUT = 1800.0
 DEFAULT_MAX_SESSIONS = 4
@@ -91,16 +100,22 @@ def _session_ceiling(budget, max_sessions):
 
 
 class Entry:
-    def __init__(self, sess, flags, cwd, deps, graph, toolchain=None):
+    def __init__(self, sess, flags, cwd, toolchain=None):
         self.sess = sess
         self.flags = flags
         self.cwd = cwd
-        self.deps = deps
-        self.fingerprint = project.fingerprint(deps)
-        self.graph = graph
         self.toolchain = toolchain
+        # .vo path -> (mtime_ns, size) as each was when the session loaded it.
+        # Filled in after every check from what Rocq says it has loaded.
+        self.loaded = {}
+        self.libraries = {}         # logical name -> .vo path
         self.last_used = time.time()
         self.lock = threading.Lock()
+
+    def loaded_changed(self):
+        """Has any .vo the session holds been rebuilt, removed or replaced?"""
+        now = project.fingerprint(sorted(self.loaded))
+        return any(self.loaded[p] != (m, sz) for p, m, sz in now)
 
 
 class Server:
@@ -118,8 +133,34 @@ class Server:
         self.budget = _budget_bytes()
         self.min_free = _min_free_bytes()
         self.started = time.time()
+        self.graphs = {}
+        # Only ever compiles on request: `--compile` and `--rebuild`.
+        self.compiler = compile_mod.Compiler(
+            available=_available_bytes, min_free=self.min_free)
 
     # -------------------------------------------------------------- sessions
+
+    @staticmethod
+    def _toolchain_env(toolchain):
+        rocq, env_items = (toolchain or (None, ()))
+        # MERGE, never replace: subprocess `env=` is the child's whole
+        # environment, and a child without HOME or TMPDIR misbehaves in
+        # ways that have nothing to do with Rocq.
+        env = dict(os.environ, **dict(env_items)) if env_items else None
+        return rocq or "rocq", env
+
+    def _graph(self, flags, cwd, toolchain):
+        """The dependency graph for one project, shared by its sessions."""
+        key = (cwd, tuple(flags), toolchain)
+        with self.lock:
+            g = self.graphs.get(key)
+        if g is None:
+            rocq, env = self._toolchain_env(toolchain)
+            g = project.DepGraph(flags, cwd, project.find_project(cwd),
+                                 rocq=rocq, env=env)
+            with self.lock:
+                self.graphs[key] = g
+        return g
 
     def _entry(self, path, force_cold=False, silent=True, toolchain=None):
         """The warm session for `path`, cold-started if anything moved."""
@@ -131,33 +172,22 @@ class Server:
             if entry.flags != flags:
                 self._drop(key)                 # the build flags changed
                 entry = None
-            elif project.fingerprint(entry.deps) != entry.fingerprint:
-                self._drop(key)                 # a dependency was rebuilt
-                entry = None
             elif entry.toolchain != toolchain:
                 self._drop(key)                 # a different Rocq / opam switch
+                entry = None
+            elif entry.loaded_changed():
+                self._drop(key)                 # a dependency was rebuilt
                 entry = None
             elif (force_cold or not entry.sess.alive
                   or entry.sess.silent != silent):
                 self._drop(key)
                 entry = None
         if entry is None:
-            rocq, env_items = (toolchain or (None, ()))
-            rocq = rocq or "rocq"
-            # MERGE, never replace: subprocess `env=` is the child's whole
-            # environment, and a child without HOME or TMPDIR misbehaves in
-            # ways that have nothing to do with Rocq.
-            env = dict(os.environ, **dict(env_items)) if env_items else None
-            proj = project.find_project(key)
-            graph = project.dep_graph(
-                flags, cwd, project.project_sources(proj, cwd),
-                rocq=rocq, env=env)
-            deps = project.closure(key, flags, cwd, graph,
-                                   rocq=rocq, env=env) or []
+            rocq, env = self._toolchain_env(toolchain)
             sess = session_mod.Session(
                 key, flags, cwd=cwd, silent=silent, rocq=rocq, env=env,
                 rss_limit=_session_ceiling(self.budget, self.max_sessions))
-            entry = Entry(sess, flags, cwd, deps, graph, toolchain)
+            entry = Entry(sess, flags, cwd, toolchain)
             with self.lock:
                 self.sessions[key] = entry
             self._record_sessions()
@@ -281,6 +311,7 @@ class Server:
         if cmd == "status":
             return self.do_status()
         if cmd == "stop":
+            self.compiler.stop()
             for key in list(self.sessions):
                 self._drop(key)
             return {"ok": True, "stopped": True}     # _serve_one then exits
@@ -289,19 +320,56 @@ class Server:
         return {"ok": False, "error": "unknown command %r" % cmd}
 
     def do_check(self, req):
-        path = req["path"]
+        path = os.path.abspath(req["path"])
         try:
             text = open(path, "rb").read()
         except OSError as e:
             return {"ok": False, "error": str(e)}
+        t0 = time.time()
         timeout = float(req.get("timeout") or DEFAULT_CHECK_TIMEOUT)
         # `Set Silent` is decided when the session starts, so asking for the
         # proof's own output means starting over.
         toolchain = (req.get("rocq"),
                      tuple(sorted((req.get("env") or {}).items())))
+        rocq, env = self._toolchain_env(toolchain)
+        flags, cwd = project.flags_for(path)
+
+        # What this text loads, from its Require lines as they are NOW.
+        graph = self._graph(flags, cwd, toolchain)
+        graph.refresh(extra=[path])
+        closure = graph.closure(path)
+
+        # A compile of this file from an older text is describing a file that
+        # no longer exists; a compile of the same text is left to finish.
+        digest = compile_mod.digest_of(text=text)
+        compile_mod.log("check: %s (digest %s%s%s)", path, digest[:8],
+                        ", --compile" if req.get("wait_vo") else "",
+                        ", --rebuild" if req.get("rebuild") else "")
+        self._cancel_other_text(path, digest)
+
+        # Refuse to check against a library that no longer matches its
+        # source.  A compile we started ourselves is waited for instead.
+        stale = self._stale(closure, graph, deadline=t0 + timeout)
+        if stale and req.get("rebuild"):
+            failure = self._rebuild(closure, stale, graph, rocq, env,
+                                    deadline=t0 + timeout)
+            if failure is not None:
+                return failure
+            stale = self._stale(closure, graph, deadline=t0 + timeout)
+        stale_rows = [self._stale_row(vo, why) for vo, why in stale]
+        if stale and not req.get("allow_stale"):
+            return {"ok": False, "stale": stale_rows,
+                    "error": "%d stale dependenc%s" % (
+                        len(stale), "y" if len(stale) == 1 else "ies")}
+
         entry = self._entry(path, force_cold=bool(req.get("cold")),
                             silent=not bool(req.get("verbose")),
                             toolchain=toolchain)
+        # Everything we know the session holds or is about to load, stat'ed
+        # BEFORE it loads anything.  A .vo rebuilt while the check runs must
+        # not be recorded with its new mtime as if that were what was loaded.
+        watched = sorted(set(closure) | set(entry.loaded))
+        pre = {p: (m, sz) for p, m, sz in project.fingerprint(watched)}
         with entry.lock:
             if not entry.sess.alive:
                 entry.sess.start()
@@ -309,19 +377,50 @@ class Server:
                 result = entry.sess.check(text, timeout=timeout)
             except session_mod.FeedTimeout as e:
                 entry.sess.stop()
-                self._drop(os.path.abspath(path))
+                self._drop(path)
                 return {"ok": False, "error": "timed out after %.0fs (%s); "
                                               "session discarded" % (timeout, e)}
             except session_mod.MemoryLimit as e:
                 entry.sess.stop()
-                self._drop(os.path.abspath(path))
+                self._drop(path)
                 return {"ok": False,
                         "error": "%s; session discarded (raise the ceiling "
                                  "with ROCQ_WARM_MAX_SESSION_GB)" % e}
             except session_mod.SessionDead as e:
-                self._drop(os.path.abspath(path))
+                self._drop(path)
                 return {"ok": False, "error": "rocq died: %s" % e}
+            unreliable = None
+            try:
+                libraries = entry.sess.loaded_libraries()
+            except Exception as e:                      # noqa: BLE001
+                libraries, unreliable = {}, "%s: %s" % (type(e).__name__, e)
             rss = entry.sess.rss_bytes()
+        post = {p: (m, sz) for p, m, sz in project.fingerprint(
+            sorted(set(watched) | set(libraries.values())))}
+        entry.loaded = {p: pre.get(p, post[p]) for p in post}
+        entry.libraries = libraries
+        moved = [p for p in watched if pre[p] != post[p]]
+        note = None
+        if moved:
+            note = ("%s changed during the check; the verdict may be about "
+                    "either version, and the session was discarded"
+                    % ", ".join(os.path.relpath(p, self.root) for p in moved))
+            self._drop(path)
+        elif unreliable:
+            note = ("could not ask rocq what it loaded (%s); the session was "
+                    "discarded" % unreliable)
+            self._drop(path)
+        compile_mod.log("check: %s %s [%s, %d sentences, %.1fs]%s", path,
+                        "OK" if result.ok else "FAILED", result.mode,
+                        result.replayed, result.seconds,
+                        "; " + note if note else "")
+        job = None
+        if result.ok and not moved and req.get("wait_vo"):
+            job = self.compiler.submit(path, flags, cwd, rocq=rocq, env=env,
+                                       digest=digest)
+            self.compiler.wait(path, timeout=max(0.0, t0 + timeout - time.time()))
+            compile_mod.log("check: %s waited for job %d: %s", path, job.seq,
+                            job.state)
         self._evict()
         return {
             "ok": True,
@@ -331,11 +430,77 @@ class Server:
             "sentences": result.total,
             "seconds": result.seconds,
             "rss": rss,
+            "libraries": len(libraries),
+            "stale": stale_rows,            # only when allow_stale let it through
+            "note": note,
+            "vo": _describe_job(job) if job is not None else None,
+            # Why make would rebuild THIS file's .vo now -- after a green
+            # check that is "its source is newer", which the user is told.
+            "vo_stale": project.staleness(project.vo_of(path), graph.graph),
             "diags": [{"kind": d.kind,
                        "span": d.span(text),
                        "message": d.message().decode("utf8", "replace")}
                       for d in result.diags],
         }
+
+    # ------------------------------------------------------------ staleness
+
+    def _stale(self, closure, graph, deadline):
+        """Stale members of `closure`, after waiting for our own compiles.
+
+        A `.vo` that is stale because its compile has not finished yet is
+        not a reason to refuse; it is a reason to wait.  Only the daemon's
+        own jobs are waited for -- somebody's `make` in another terminal is
+        invisible, and guessing at it would be guessing.
+        """
+        while True:
+            stale = project.stale_deps(closure, graph.graph)
+            pending = [j for j in (self.compiler.pending(vo) for vo, _w in stale)
+                       if j is not None]
+            if not pending or time.time() >= deadline:
+                return stale
+            for j in pending:
+                self.compiler.wait(j.v, timeout=max(0.0, deadline - time.time()))
+
+    def _stale_row(self, vo, why):
+        row = {"vo": vo, "why": why}
+        job = self.compiler.jobs.get(project.v_of(vo))
+        if job is not None and job.state == "failed":
+            row["compile_output"] = job.output.decode("utf8", "replace")
+            row["why"] += " (rocq-warm's own compile of it failed)"
+        return row
+
+    def _rebuild(self, closure, stale, graph, rocq, env, deadline):
+        """Compile what is stale, and what that makes stale, in order.
+
+        Returns a response describing the failure, or None on success.
+        """
+        plan = project.rebuild_plan(closure, stale, graph.graph)
+        jobs = []
+        for vo, after in plan:
+            v = project.v_of(vo)
+            if not os.path.isfile(v):
+                return {"ok": False, "error": "cannot rebuild %s: %s does not "
+                                              "exist" % (vo, v)}
+            flags, cwd = project.flags_for(v)
+            jobs.append(self.compiler.submit(v, flags, cwd, rocq=rocq, env=env,
+                                             after=after))
+        self.compiler.wait_all(jobs, timeout=max(0.0, deadline - time.time()))
+        failed = [j for j in jobs if j.done and not j.succeeded]
+        if failed:
+            return {"ok": False,
+                    "error": "rebuilding %s failed" % ", ".join(
+                        os.path.relpath(j.v, self.root) for j in failed),
+                    "compile_failed": [_describe_job(j) for j in failed]}
+        if not all(j.done for j in jobs):
+            return {"ok": False, "error": "timed out rebuilding %d stale "
+                                          "dependencies" % len(jobs)}
+        return None
+
+    def _cancel_other_text(self, path, digest):
+        job = self.compiler.jobs.get(path)
+        if job is not None and not job.done and job.digest != digest:
+            self.compiler.cancel(path)
 
     def do_status(self):
         out = []
@@ -348,10 +513,13 @@ class Server:
                 "complete": entry.sess.complete,
                 "rss": entry.sess.rss_bytes(),
                 "idle": time.time() - entry.last_used,
+                "libraries": len(entry.libraries),
+                "watched": len(entry.loaded),
             })
         return {"ok": True, "pid": os.getpid(), "uptime": time.time() - self.started,
                 "budget": self.budget, "min_free": self.min_free,
-                "available": _available_bytes(), "sessions": out}
+                "available": _available_bytes(), "sessions": out,
+                "compiles": self.compiler.status()}
 
     # ----------------------------------------------------------------- serve
 
@@ -413,6 +581,7 @@ class Server:
 
     def shutdown(self):
         """Stop every session, then the daemon.  Never leave a child behind."""
+        self.compiler.stop()
         for key in list(self.sessions):
             self._drop(key)
         os._exit(0)
@@ -434,6 +603,14 @@ class Server:
                 conn.close()
             except Exception:
                 pass
+
+
+def _describe_job(job):
+    if job is None:
+        return None
+    d = job.describe()
+    d["output"] = job.output.decode("utf8", "replace")
+    return d
 
 
 def send_msg(sock, obj):

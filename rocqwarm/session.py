@@ -103,6 +103,7 @@ class Session:
         self.complete = False
         self.text_being_fed = b""
         self._scan_pos = 0
+        self._libmap = {}           # logical name -> .vo path, as Rocq reports it
 
     # ---------------------------------------------------------------- process
 
@@ -123,6 +124,7 @@ class Session:
         self.sentences = []
         self.text = b""
         self.complete = False
+        self._libmap = {}
         self._stop_writing.clear()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -321,8 +323,21 @@ class Session:
         writer = threading.Thread(target=self._write_all, args=(payload,), daemon=True)
         writer.start()
         try:
-            stopped_early = self._await_sentinel(
-                sentinel_pat, timeout, stop_on_error)
+            try:
+                stopped_early = self._await_sentinel(
+                    sentinel_pat, timeout, stop_on_error)
+            except Unterminated:
+                # Everything was written and Rocq is still waiting: the text
+                # ended inside a sentence, a comment or a string, and our
+                # sentinel went in after it.  Close it off before reporting,
+                # or the NEXT feed -- a `BackTo`, a query -- lands inside it too
+                # and the session is lost for a check that was never going to
+                # pass anyway.
+                self._stop_writing.set()
+                writer.join(timeout=10)
+                self._recover(data, base, timeout)
+                self._trim_to_last_prompt()
+                raise
             if stopped_early:
                 # We stopped mid-chunk, so Rocq is waiting for the rest of a
                 # sentence and will never reach the sentinel we queued.  Close
@@ -330,16 +345,7 @@ class Session:
                 self._stop_writing.set()
                 writer.join(timeout=10)
                 self._interrupt_stalled_work()
-                consumed = self.stream_written - base
-                depth, in_string = self.lex_state(data[:consumed])
-                recovery = (b'"' if in_string else b"") + b" *)" * depth + b" .\n"
-                self._sentinel += 1
-                sentinel = (SENTINEL_FMT % self._sentinel)
-                sentinel_pat = re.compile(
-                    rb'Chars \d+ - \d+ \['
-                    + re.escape(sentinel.replace(" ", "~").encode()) + rb'\]')
-                self._raw_write(recovery + sentinel.encode() + b"\n")
-                self._await_sentinel(sentinel_pat, timeout, stop_on_error=False)
+                sentinel = self._recover(data, base, timeout)
         finally:
             self._stop_writing.set()
             writer.join(timeout=10)
@@ -360,6 +366,22 @@ class Session:
         items = items[:end]
         self._trim_to_last_prompt()
         return items, base
+
+    def _recover(self, data, base, timeout):
+        """Close whatever of `data` is lexically open, terminate the
+        sentence Rocq is waiting on, and bring it back to a prompt.  Returns
+        the sentinel that marks the recovery."""
+        consumed = self.stream_written - base
+        depth, in_string = self.lex_state(data[:consumed])
+        recovery = (b'"' if in_string else b"") + b" *)" * depth + b" .\n"
+        self._sentinel += 1
+        sentinel = (SENTINEL_FMT % self._sentinel)
+        sentinel_pat = re.compile(
+            rb'Chars \d+ - \d+ \['
+            + re.escape(sentinel.replace(" ", "~").encode()) + rb'\]')
+        self._raw_write(recovery + sentinel.encode() + b"\n")
+        self._await_sentinel(sentinel_pat, timeout, stop_on_error=False)
+        return sentinel
 
     def _sigint(self):
         """Interrupt the command Rocq is running.
@@ -724,6 +746,8 @@ class Session:
         except Unterminated:
             self.text = text[:resume]
             self.complete = False
+            if self.sentences:
+                self._backtrack(self.sentences[-1].state_after)
             return CheckResult(
                 False,
                 self._prefix_diags() + [Diag(
@@ -776,6 +800,65 @@ class Session:
 
     def _backtrack(self, state):
         self._feed_raw(("BackTo %d." % state).encode(), timeout=300)
+
+    def _state_now(self):
+        """The state id Rocq is parked at, from its most recent prompt."""
+        with self._cv:
+            last = None
+            for last in protocol.PROMPT_RE.finditer(self.buf):
+                pass
+            if last is None:
+                return None
+            body = protocol.PROMPT_BODY_RE.match(last.group(1))
+            return int(body.group(2)) if body else None
+
+    LIB_NAME_RE = re.compile(rb'^[^\s"<>]+$')
+    LOCATED_RE = re.compile(
+        rb'(\S+) has been loaded from file\s+(.+?)\s*$', re.S)
+
+    def loaded_libraries(self, timeout=300):
+        """{logical name: .vo path} for every library Rocq has loaded.
+
+        Asked of Rocq itself -- `Print Libraries.` for the names, `Locate
+        Library` for the files -- because that is the only source that knows.
+        `rocq dep` cannot see an installed library, nor a `Require` that was
+        added after the session started; the process that did the loading
+        can.  The queries are undone with `BackTo`, so the session is parked
+        exactly where it was.  A few hundred `Locate Library` queries cost
+        tens of milliseconds, and each name is asked about once per session.
+        """
+        if not self.alive:
+            return {}
+        parked = self._state_now()
+        try:
+            items, _ = self._feed_raw(b"Print Libraries.", timeout=timeout)
+            names = []
+            for it in items:
+                if not isinstance(it, protocol.Sentence):
+                    continue
+                for line in protocol.message_text(it.messages).splitlines():
+                    line = line.strip()
+                    if line and self.LIB_NAME_RE.match(line):
+                        names.append(line.decode("utf8", "replace"))
+            unknown = [n for n in names if n not in self._libmap]
+            if unknown:
+                query = b"".join(b"Locate Library %s.\n" % n.encode()
+                                 for n in unknown)
+                items, _ = self._feed_raw(query, timeout=timeout)
+                for it in items:
+                    if not isinstance(it, protocol.Sentence):
+                        continue
+                    m = self.LOCATED_RE.search(protocol.message_text(it.messages))
+                    if m is None:
+                        continue
+                    name = m.group(1).decode("utf8", "replace")
+                    path = re.sub(rb'\s+', b'', m.group(2)).decode("utf8", "replace")
+                    self._libmap[name] = os.path.normpath(
+                        os.path.join(self.cwd, path))
+        finally:
+            if parked is not None and self.alive:
+                self._backtrack(parked)
+        return {n: self._libmap[n] for n in names if n in self._libmap}
 
 
 def _diags_of(item, include_info=False):

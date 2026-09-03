@@ -22,8 +22,32 @@ Diagnostics come out in `coqc`'s exact format and the exit code is `coqc`'s, so
 whatever you already grep for keeps working.
 
 It is an **edit-loop tool, not a build tool**: it writes no `.vo`, and your
-build system stays the source of truth. `--compile` runs a real `coqc`
-afterwards when you want both.
+build system stays the source of truth. A real compile would double the cost
+of every passing check, so a green check tells you instead that the `.vo` is
+now behind:
+
+```console
+$ rocq-warm check proofs/FsReady.v
+rocq-warm: proofs/FsReady.v OK [replay, 41/2210 sentences, 3.1s, 2.9 GB]
+rocq-warm: warning: proofs/FsReady.vo was NOT regenerated (proofs/FsReady.v is newer than proofs/FsReady.vo); anything that requires it is refused until it is rebuilt -- run make, or `rocq-warm check proofs/FsReady.v --compile`
+```
+
+and a check of anything that requires a stale library is **refused** rather
+than answered from the old `.vo`:
+
+```console
+$ rocq-warm check proofs/FirstTok.v
+rocq-warm: proofs/FirstTok.v NOT CHECKED -- 1 dependency is stale (make would rebuild it):
+  proofs/FsReady.v is newer than proofs/FsReady.vo
+rocq-warm: rebuild it first, or pass --rebuild to have rocq-warm compile it, or --allow-stale to check against it anyway
+```
+
+That is exit code 2 -- not a verdict about the proof. Without it, a proof
+checked against the pre-edit library fails for a reason that looks exactly
+like a proof error, or passes when it should not, and nothing says so until a
+real `make`. "Stale" is `make`'s own rule: a `.vo` that is missing, older than
+its `.v`, or older than a `.vo` it requires, anywhere in the file's transitive
+closure.
 
 ## Requirements
 
@@ -46,11 +70,26 @@ ln -s ~/src/rocq-warm/rocq-warm ~/bin/rocq-warm
 ```console
 rocq-warm check FILE.v          # check it; exit 0 if it compiles, 1 if not
 rocq-warm check FILE.v --cold   # ignore any warm session
-rocq-warm check FILE.v --compile        # also run a real coqc on success
+rocq-warm check FILE.v --compile        # on success, also write the .vo (a real rocq compile)
+rocq-warm check FILE.v --rebuild        # first compile any stale dependency, in order
+rocq-warm check FILE.v --allow-stale    # check against stale dependencies anyway (warns)
 rocq-warm check FILE.v --show-output    # also print what the proof prints
 rocq-warm status                # what the daemon is holding
 rocq-warm stop                  # free the sessions
 ```
+
+Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
+stale dependency, no daemon, no `rocq`), 3 a green verdict that a real
+`rocq compile` then rejected -- a bug in rocq-warm, please report it.
+
+`--compile` and `--rebuild` run the build's own step -- `rocq compile` with
+the flags from the nearest `_CoqProject`, writing the `.vo` where `make`
+writes it -- and nothing else. A check in another terminal that finds a `.vo`
+stale because one of these compiles is still running waits for it instead of
+refusing. `--rebuild` compiles everything stale in the closure plus everything
+in the closure that depends on it, in dependency order, `ROCQ_WARM_COMPILE_JOBS`
+(default 2) at a time; a rebuild that fails prints that file's errors and
+exits 2, leaving its old `.vo` exactly as `make` would.
 
 Load path and flags come from the nearest `_CoqProject`.
 
@@ -84,8 +123,12 @@ the tactics behind a failure, and how sessions are keyed and collected.
 One daemon per workspace (the git checkout, else the `_CoqProject` directory),
 on `<root>/.rocq-warm/sock`. Under it, one `rocq repl` session per `.v` file.
 
-A session is kept until: the build flags change; a `.vo` it depends on changes;
-the `rocq` you invoke with changes; `--cold` or `--show-output` is passed; it
+A session is kept until: the build flags change; any `.vo` it has loaded
+changes on disk (the set is what Rocq itself reports having loaded -- the
+standard library and installed packages included, and a `Require` added by a
+later edit); a `.vo` changes *while* a check is running, in which case the
+verdict is reported and the session dropped; the
+`rocq` you invoke with changes; `--cold` or `--show-output` is passed; it
 falls out of the LRU under the session-count or memory budget; it goes
 untouched for the idle timeout; it exceeds its own RSS ceiling mid-check; or
 the check exceeds its wall timeout.
@@ -120,6 +163,7 @@ kill is a cost somebody else pays.
 | `ROCQ_WARM_MAX_RSS_GB` | this daemon's sessions together: `min(half of RAM, 32 GB)` |
 | `ROCQ_WARM_MAX_SESSION_GB` | half the budget — enough for a big proof, not for a runaway |
 | `ROCQ_WARM_MIN_FREE_GB` | `max(4 GB, 5% of RAM)` left free for everyone else |
+| `ROCQ_WARM_COMPILE_JOBS` | 2 -- `--compile`/`--rebuild` compiles at once; none start below the free-memory floor |
 | sessions per daemon | 4, LRU |
 
 `rocq-warm status` shows what is resident and how close the machine is to the
@@ -130,7 +174,7 @@ because the state machine keeps a state per sentence.
 
 ```console
 $ make test
-Ran 89 tests in 123s
+Ran 140 tests in 231s
 OK
 ```
 
@@ -145,8 +189,20 @@ with Rocq.
   edits, with `coqc` consulted after every one.
 - `test_rocq_warm_recovery.py` — stopping a feed early, and the lexical
   recovery that lets it resume.
+- `test_rocq_warm_staleness.py` — every way a session could answer for a
+  library that no longer exists: a `.vo` older than its source, transitively,
+  under another `-R` root, half-rebuilt, added by a `Require` mid-session,
+  rebuilt during a check; and what `--compile`, `--rebuild` and
+  `--allow-stale` do about it. Each drives the real CLI, because the point
+  is what a *second* process sees.
+- `test_rocq_warm_compile.py` — the on-request compiler: same outputs as
+  `make`, stamped so an edit during the compile shows, cancelled and cleaned
+  up when the text changes, dependencies before dependents.
 - `test_rocq_warm_project.py`, `test_rocq_warm_daemon.py`,
   `test_rocq_warm_robustness.py`.
+
+The same suite runs in GitHub Actions on every push, inside the official
+Rocq images, once per supported Rocq version (`.github/workflows/test.yml`).
 
 `tests/rocq_warm_corpus.py` runs the same equivalence property against real
 proofs — `coqc` as the oracle, once per edited version:

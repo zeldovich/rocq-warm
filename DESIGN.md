@@ -47,23 +47,110 @@ deadlocks the feed. Rocq also writes the `Chars` line straight after
 
 ## Deciding what to re-execute
 
-1. **Invalidate?** Any `.vo` in the file's `rocq dep` closure rebuilt, the
+1. **Refuse?** Any `.vo` in the file's transitive closure that `make` would
+   rebuild — missing, older than its `.v`, older than a `.vo` it requires —
+   is not checked against at all (exit 2, naming it). See *Stale libraries*.
+2. **Invalidate?** Any `.vo` the session has loaded rebuilt, the
    `_CoqProject` flags changed, or a different `rocq` — throw the session away.
-   Direct requires are not enough: Rocq loads the closure.
-2. Find the first sentence the edit could have touched, by common byte prefix.
-3. A **whitespace/comment-only edit** inside one gap shifts the stored offsets
+   The loaded set is what Rocq reports, not what `rocq dep` predicts.
+3. Find the first sentence the edit could have touched, by common byte prefix.
+4. A **whitespace/comment-only edit** inside one gap shifts the stored offsets
    and executes nothing.
-4. **Undoing a `Require`** (or `Declare ML Module`/`Load`) forces a cold start.
+5. **Undoing a `Require`** (or `Declare ML Module`/`Load`) forces a cold start.
    Adding one below the existing ones replays fine.
-5. Otherwise `BackTo` the state after the last unaffected sentence, and feed
+6. Otherwise `BackTo` the state after the last unaffected sentence, and feed
    from there.
-6. **Stop at the first failing sentence** and park the session there, so the
+7. **Stop at the first failing sentence** and park the session there, so the
    next edit — the fix for it — replays from exactly that point.
 
 In the shift case the stored anchor moves with the text. It is not a semantic
 position there but the origin the CACHED message offsets were measured from, so
 it has to travel with the text they point into; recomputing it from the new gap
 leaves those offsets short by the gap's change in width.
+
+## Stale libraries
+
+A warm session that answers for a library that no longer exists is worse than
+no session, and there are two distinct ways to get one. Both happened in the
+field before this section was written, and they need different cures.
+
+**The `.vo` on disk was rebuilt under the session.** The cache-invalidation
+case. The session loaded `FsReady.vo` an hour ago; `make` replaced it; every
+answer since is about the old one. The cure is a fingerprint — `(mtime_ns,
+size)` per file — of everything the session loaded, compared before every
+check, and the whole question is *which files*. The first version used the
+`rocq dep` closure computed at cold start, which is wrong three ways, each of
+which was found by looking rather than by reasoning:
+
+- `rocq dep` is only run over the files a `_CoqProject` lists, and
+  `-R ../model Riscv` makes a whole other tree loadable. Files in that tree
+  appear in the graph as edges but never as nodes, so nothing beneath them is
+  watched. On one real tree 7 of a file's 232 closure members had no entry.
+- `rocq dep` never lists the standard library or anything installed in the
+  switch. `opam upgrade` replaces those in place.
+- The closure was computed once. A `Require` added by a later edit replays
+  fine — and loads a library nobody had written down.
+
+So the set watched is now **what Rocq says it loaded**: after every check the
+session is asked `Print Libraries.` and, for any name not yet mapped, `Locate
+Library X.`, which prints the physical `.vo`. Both work under `Set Silent`,
+inside a proof, and cost tens of milliseconds for a few hundred libraries; the
+queries are undone with `BackTo` so the session is parked exactly where it
+was. The `rocq dep` closure is still unioned in, so nothing is lost if the
+answer is ever short.
+
+One race inside that: the fingerprint of a file must be the one *as loaded*.
+A `.vo` rebuilt while Rocq is busy with a long proof would, if stat'ed after
+the check, be recorded with its new mtime as if that were what got loaded.
+So everything known in advance is stat'ed before the session loads anything;
+after the check, a file whose stat moved means the verdict may be about
+either version — it is reported as such, and the session is dropped.
+
+**The `.vo` on disk is itself stale.** The case that confused people. A file
+is edited and warm-checked green; its dependents are checked next, against
+the `.vo` `make` produced *before* the edit. Nothing here is a cache problem —
+a cold `coqc` loads the same old `.vo` — the problem is that a tool that just
+said "OK" about the edit did not make the edit visible to anything else, and
+the false failures ("remaining open goals" for a conjunct that no longer
+exists) and false passes that follow look exactly like proof results. The
+cure is not to compile the `.vo` — that would double the cost of every green
+check, which is the cost the tool exists to remove — but to make the
+situation impossible to mistake:
+
+- a green check says, on stderr, that its `.vo` was **not** regenerated,
+  whenever `make` would now rebuild it;
+- a check of any file is **refused** (exit 2, not 1, naming the file and the
+  reason) when anything in its closure is something `make` would rebuild:
+  missing, older than its `.v`, or older than a `.vo` it requires. Make's
+  rule, verbatim, because it is the rule the build applies and the one users
+  already reason with; equal mtimes are current.
+
+`--compile` and `--rebuild` then run the build's own step on request —
+`rocq compile` with the project's flags, writing where `make` writes — and a
+check that finds a `.vo` stale because such a compile is still running waits
+for it. The finished `.vo` is stamped with the time the compile *started*, so
+an edit that lands mid-compile leaves the `.v` newer and the rule still
+fires; a cancelled or failed compile removes whatever it wrote, because a
+truncated `.vo` with a fresh mtime is indistinguishable from a good one to
+every mtime rule there is.
+
+The trap inside that, and the one place a naive version writes a wrong `.vo`:
+**`rocq compile` reads the `.v` from disk, not from us.** A job queued for the
+text a check just approved can start running after the file has already become
+something else, and would then compile *that* under the approved job's name —
+a `.vo` of text nobody checked. So a job carries the digest of the text it was
+asked to compile, refuses to start if the file no longer hashes to it (a newer
+job covers the newer text), and discards its output if the file changes while
+it runs. Found by a flake in exactly this test: a slow proof's compile
+finished in 0.1s because the file it was handed had been overwritten with a
+one-line version in between.
+
+Two `rocq dep` facts the graph code has to know: it prints **nothing at all**
+when any file it is handed does not exist (and `_CoqProject` files routinely
+list generated sources that are not there yet), and a full run over a large
+tree costs over a second, so the graph is kept incrementally — every source is
+stat'ed on each check, only the ones whose mtime moved are re-run, which is
+always at least the file being edited.
 
 ## Three things that look like bugs and are not
 
@@ -79,7 +166,11 @@ deadlock is the one we want.
 
 **Cutting a feed short leaves Rocq mid-sentence**, and a bare `.` is not a
 terminator inside a comment or a string. `Session.lex_state` scans what was
-actually written and emits exactly what has to be closed first.
+actually written and emits exactly what has to be closed first. The same
+recovery runs when the *file* ends inside a comment or string and swallows
+the sentinel: without it the next thing written — a `BackTo`, a query — lands
+inside the comment too, and the session is lost for a check that was never
+going to pass.
 
 **Message offsets are relative to neither the sentence nor the line the error
 is on.** `Toplevel input, characters A-B` is measured from wherever Rocq landed

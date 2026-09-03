@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +44,32 @@ class Workspace:
     def flags(self):
         return ["-R", ".", self.logical]
 
+    def build(self, *names, **kw):
+        """Compile these files for real, in order, the way `make` would."""
+        for name in names:
+            subprocess.run(["coqc", "-q"] + self.flags + [name], cwd=self.dir,
+                           check=True, capture_output=True,
+                           timeout=kw.get("timeout", 300))
+
+    def path(self, name):
+        return os.path.join(self.dir, name)
+
+    def touch(self, name, text=None):
+        """Make `name` newer than anything written so far.
+
+        A plain `touch` can land in the same clock tick as the previous write
+        on a fast machine, and equal mtimes are up to date to `make` and to
+        us alike.  Bump it explicitly instead.
+        """
+        path = self.path(name)
+        if text is not None:
+            self.write(name, text)
+        latest = max((os.stat(os.path.join(self.dir, f)).st_mtime_ns
+                      for f in os.listdir(self.dir)), default=0)
+        now = max(time.time_ns(), latest + 1_000_000)
+        os.utime(path, ns=(now, now))
+        return path
+
     def coqc(self, name, timeout=300):
         """(returncode, normalized diagnostics) from a real cold compile."""
         proc = subprocess.run(["coqc", "-q"] + self.flags + [name],
@@ -64,6 +91,16 @@ class Workspace:
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def wait_for(pred, timeout=60, step=0.1):
+    """Poll `pred` until it holds; returns whether it did in time."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(step)
+    return pred()
 
 
 _WS = re.compile(r'[ \t]+')

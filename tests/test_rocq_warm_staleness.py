@@ -404,17 +404,22 @@ class VoTests(StalenessCase):
                             "\n%s%s" % (u.stdout.decode(), u.stderr.decode()))
 
     def test_compile_disagreeing_with_the_verdict_is_exit_3(self):
-        """Not reachable through Rocq -- that would be the bug the code
-        exists to report -- so provoke it by making the compile step fail
-        for a reason the session cannot see: the .v directory is read-only,
-        so the .vo cannot be written."""
-        if os.geteuid() == 0:
-            self.skipTest("root can write anywhere")
-        os.chmod(self.ws.dir, 0o555)
-        self.addCleanup(os.chmod, self.ws.dir, 0o755)
+        """A green verdict whose real `rocq compile` then fails is the one
+        thing that must never happen quietly: it means rocq-warm and coqc
+        disagree.  It is not reachable through Rocq itself -- that would be
+        the bug the exit code exists to announce -- so provoke it from
+        outside, by making the .vo unwritable in a way that leaves the
+        session (which only reads the .v) and the daemon untouched: a
+        DIRECTORY where the .vo file has to go.  `rocq compile` cannot open
+        it, exits non-zero, and rocq-warm must surface that as exit 3.
+        """
+        os.mkdir(self.ws.path("Dep.vo"))       # rocq compile cannot write over it
         proc = self.check("Dep.v", "--compile")
-        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual(proc.returncode, 3,
+                         b"%s%s" % (proc.stdout, proc.stderr))
         self.assertIn(b"DISAGREED", proc.stderr)
+        self.assertTrue(os.path.isdir(self.ws.path("Dep.vo")),
+                        "the failed compile must not have removed the blocker")
 
 
 class RebuildTests(StalenessCase):
